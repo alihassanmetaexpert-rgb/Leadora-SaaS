@@ -2,6 +2,7 @@
 Leadora — FastAPI Backend
 =================================
 Google Maps Lead Generation + Google Sheets OAuth
+Tokens stored in Redis for persistence across restarts.
 """
 
 import os
@@ -12,9 +13,8 @@ import threading
 import time
 from datetime import datetime
 from typing import Optional
-from pathlib import Path
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -37,9 +37,27 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# ── In-memory stores ──────────────────────────────────────────────────────────
-jobs: dict   = {}
-tokens: dict = {}   # user_id -> token dict
+# ── Redis setup ───────────────────────────────────────────────────────────────
+import redis as redis_lib
+
+REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True)
+
+def save_token(user_id: str, token_data: dict):
+    redis_client.set(f"token:{user_id}", json.dumps(token_data), ex=60*60*24*30)
+
+def get_token(user_id: str) -> dict:
+    data = redis_client.get(f"token:{user_id}")
+    return json.loads(data) if data else None
+
+def delete_token(user_id: str):
+    redis_client.delete(f"token:{user_id}")
+
+def has_token(user_id: str) -> bool:
+    return redis_client.exists(f"token:{user_id}") > 0
+
+# ── In-memory job store ───────────────────────────────────────────────────────
+jobs: dict = {}
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -81,7 +99,6 @@ class SheetSyncRequest(BaseModel):
 # ── Google OAuth helpers ──────────────────────────────────────────────────────
 
 def get_google_auth_url(user_id: str) -> str:
-    """Generate Google OAuth URL for a user."""
     from urllib.parse import urlencode
     params = {
         "client_id":     GOOGLE_CLIENT_ID,
@@ -96,7 +113,6 @@ def get_google_auth_url(user_id: str) -> str:
 
 
 def exchange_code_for_token(code: str) -> dict:
-    """Exchange OAuth code for access + refresh tokens."""
     import requests
     resp = requests.post("https://oauth2.googleapis.com/token", data={
         "code":          code,
@@ -108,28 +124,15 @@ def exchange_code_for_token(code: str) -> dict:
     return resp.json()
 
 
-def refresh_access_token(refresh_token: str) -> dict:
-    """Refresh an expired access token."""
-    import requests
-    resp = requests.post("https://oauth2.googleapis.com/token", data={
-        "refresh_token": refresh_token,
-        "client_id":     GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "grant_type":    "refresh_token",
-    })
-    return resp.json()
-
-
 def get_gspread_client(user_id: str):
-    """Get authenticated gspread client for a user using their OAuth token."""
     import gspread
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request as GRequest
 
-    if user_id not in tokens:
+    token_data = get_token(user_id)
+    if not token_data:
         raise Exception("not_authenticated")
 
-    token_data = tokens[user_id]
     creds = Credentials(
         token=token_data.get("access_token"),
         refresh_token=token_data.get("refresh_token"),
@@ -139,10 +142,10 @@ def get_gspread_client(user_id: str):
         scopes=SCOPES,
     )
 
-    # Refresh if expired
     if not creds.valid and creds.refresh_token:
         creds.refresh(GRequest())
-        tokens[user_id]["access_token"] = creds.token
+        token_data["access_token"] = creds.token
+        save_token(user_id, token_data)
 
     return gspread.authorize(creds)
 
@@ -168,8 +171,7 @@ def extract_sheet_id(url: str) -> str:
 
 
 def write_leads_to_sheet(client, sheet_url: str, leads: list, sheet_name: str = "Leads"):
-    """Write leads to Google Sheet."""
-    sheet_id = extract_sheet_id(sheet_url)
+    sheet_id    = extract_sheet_id(sheet_url)
     spreadsheet = client.open_by_key(sheet_id)
 
     try:
@@ -177,7 +179,6 @@ def write_leads_to_sheet(client, sheet_url: str, leads: list, sheet_name: str = 
     except Exception:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=5000, cols=15)
 
-    # Add headers if empty
     first_row = ws.row_values(1)
     if not first_row or first_row[0] != "Name":
         ws.insert_row(SHEET_HEADERS, index=1)
@@ -188,12 +189,11 @@ def write_leads_to_sheet(client, sheet_url: str, leads: list, sheet_name: str = 
             "horizontalAlignment": "CENTER"
         })
 
-    # Get existing to avoid duplicates
-    existing = ws.get_all_values()
+    existing      = ws.get_all_values()
     existing_keys = {(r[0].strip().lower(), r[4].strip())
                      for r in existing[1:] if len(r) >= 5}
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for lead in leads:
         name  = str(lead.get("name", "")).strip()
@@ -239,7 +239,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
     log = make_log_collector(job_id)
 
     try:
-        jobs[job_id]["status"] = "running"
+        jobs[job_id]["status"]     = "running"
         jobs[job_id]["started_at"] = datetime.now().isoformat()
         log(f"🚀 Starting Leadora for: {request.query} in {request.city}")
         log(f"🎯 Target: {request.limit} leads")
@@ -276,7 +276,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 log(f"  [{len(all_leads)}/{request.limit}] ✓ {lead['name']}" +
                     (f"  |  {phone}" if phone else ""))
                 jobs[job_id]["leads_found"] = len(all_leads)
-                jobs[job_id]["leads"] = all_leads.copy()
+                jobs[job_id]["leads"]       = all_leads.copy()
             return added
 
         driver = None
@@ -348,12 +348,11 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         if not all_leads:
             log("\n❌ No leads found. Try a different search or city.")
             jobs[job_id]["status"] = "completed"
-            jobs[job_id]["leads"] = []
+            jobs[job_id]["leads"]  = []
             return
 
         log(f"\n✓ Scraping done: {len(all_leads)} leads in {time.time()-t0:.1f}s")
 
-        # Find emails
         if request.find_emails and not jobs[job_id].get("cancelled"):
             log(f"\n✉  Finding emails...")
             jobs[job_id]["current_source"] = "Finding emails..."
@@ -367,9 +366,8 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                                  lambda: jobs[job_id].get("cancelled", False))
             log(f"✓ Email search done")
 
-        # Sync to Google Sheets if user connected
         sheets_added = 0
-        if request.sheet_url and request.user_id and request.user_id in tokens:
+        if request.sheet_url and request.user_id and has_token(request.user_id):
             log(f"\n📊 Syncing to Google Sheets...")
             try:
                 client = get_gspread_client(request.user_id)
@@ -380,8 +378,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             except Exception as e:
                 log(f"⚠️  Sheets sync failed: {e}")
 
-        jobs[job_id]["sheets_added"] = sheets_added
-
+        jobs[job_id]["sheets_added"]   = sheets_added
         elapsed = time.time() - t0
         log(f"\n{'=' * 50}")
         log(f"✅ DONE in {elapsed:.1f}s!")
@@ -392,10 +389,10 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         if sheets_added:
             log(f"📊 Sheets rows  : {sheets_added}")
 
-        jobs[job_id]["status"]       = "completed"
-        jobs[job_id]["leads"]        = all_leads
-        jobs[job_id]["leads_found"]  = len(all_leads)
-        jobs[job_id]["completed_at"] = datetime.now().isoformat()
+        jobs[job_id]["status"]         = "completed"
+        jobs[job_id]["leads"]          = all_leads
+        jobs[job_id]["leads_found"]    = len(all_leads)
+        jobs[job_id]["completed_at"]   = datetime.now().isoformat()
         jobs[job_id]["current_source"] = ""
 
     except Exception as e:
@@ -454,14 +451,11 @@ def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
     return {
-        "job_id": job_id,
-        "status": job["status"],
-        "query": job["query"],
-        "city": job["city"],
+        "job_id": job_id, "status": job["status"],
+        "query": job["query"], "city": job["city"],
         "leads_found": job["leads_found"],
         "current_source": job.get("current_source", ""),
-        "logs": job["logs"][-30:],
-        "leads": job["leads"],
+        "logs": job["logs"][-30:], "leads": job["leads"],
         "excel_file": job.get("excel_file"),
         "sheets_added": job.get("sheets_added", 0),
         "error": job.get("error"),
@@ -475,11 +469,8 @@ def get_logs(job_id: str, from_line: int = 0):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     logs_list = jobs[job_id]["logs"]
-    return {
-        "logs": logs_list[from_line:],
-        "total_lines": len(logs_list),
-        "status": jobs[job_id]["status"]
-    }
+    return {"logs": logs_list[from_line:], "total_lines": len(logs_list),
+            "status": jobs[job_id]["status"]}
 
 
 @app.post("/job/{job_id}/cancel")
@@ -487,7 +478,7 @@ def cancel_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     jobs[job_id]["cancelled"] = True
-    jobs[job_id]["status"] = "cancelled"
+    jobs[job_id]["status"]    = "cancelled"
     return {"message": "Job cancelled"}
 
 
@@ -512,29 +503,17 @@ def list_jobs():
 
 @app.get("/auth/login")
 def auth_login(user_id: str):
-    """
-    Step 1: Frontend calls this with user_id.
-    Returns a Google login URL — open it in a popup/redirect.
-    """
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Google OAuth not configured")
-    url = get_google_auth_url(user_id)
-    return {"auth_url": url}
+    return {"auth_url": get_google_auth_url(user_id)}
 
 
 @app.get("/auth/callback")
 def auth_callback(code: str, state: str):
-    """
-    Step 2: Google redirects here after user approves.
-    Exchanges code for tokens and stores them.
-    Then redirects user back to the app.
-    """
     try:
         token_data = exchange_code_for_token(code)
-        user_id = state
-        tokens[user_id] = token_data
-        # Redirect back to the frontend app
-        frontend_url = f"https://mapseeker-spark.lovable.app/dashboard?sheets_connected=true&user_id={user_id}"
+        save_token(state, token_data)
+        frontend_url = f"https://mapseeker-spark.lovable.app/dashboard?sheets_connected=true&user_id={state}"
         return RedirectResponse(url=frontend_url)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -542,8 +521,7 @@ def auth_callback(code: str, state: str):
 
 @app.get("/auth/status/{user_id}")
 def auth_status(user_id: str):
-    """Check if a user has connected their Google account."""
-    connected = user_id in tokens and "access_token" in tokens[user_id]
+    connected = has_token(user_id)
     return {
         "user_id": user_id,
         "authenticated": connected,
@@ -553,9 +531,8 @@ def auth_status(user_id: str):
 
 @app.post("/auth/revoke/{user_id}")
 def auth_revoke(user_id: str):
-    """Disconnect a user's Google account."""
-    if user_id in tokens:
-        del tokens[user_id]
+    if has_token(user_id):
+        delete_token(user_id)
         return {"success": True, "message": "Google account disconnected"}
     return {"success": False, "message": "No account was connected"}
 
@@ -564,24 +541,14 @@ def auth_revoke(user_id: str):
 
 @app.post("/sheets/test")
 def test_sheet(request: SheetTestRequest):
-    """Test connection to user's Google Sheet."""
-    if request.user_id not in tokens:
-        return {
-            "success": False,
-            "message": "not_authenticated: Please connect your Google account first"
-        }
+    if not has_token(request.user_id):
+        return {"success": False, "message": "Please connect your Google account first"}
     try:
-        client = get_gspread_client(request.user_id)
-        sheet_id = extract_sheet_id(request.sheet_url)
+        client      = get_gspread_client(request.user_id)
+        sheet_id    = extract_sheet_id(request.sheet_url)
         spreadsheet = client.open_by_key(sheet_id)
-        ws = spreadsheet.worksheet(request.sheet_name) if request.sheet_name in \
-             [s.title for s in spreadsheet.worksheets()] else \
-             spreadsheet.add_worksheet(request.sheet_name, 5000, 15)
-        return {
-            "success": True,
-            "message": f"Connected to '{spreadsheet.title}' ✅",
-            "sheet_title": spreadsheet.title
-        }
+        return {"success": True, "message": f"Connected to '{spreadsheet.title}' ✅",
+                "sheet_title": spreadsheet.title}
     except Exception as e:
         err = str(e)
         if "not_authenticated" in err:
@@ -591,25 +558,18 @@ def test_sheet(request: SheetTestRequest):
 
 @app.post("/sheets/sync")
 def sync_to_sheet(request: SheetSyncRequest):
-    """Manually sync a completed job's leads to Google Sheets."""
-    if request.user_id not in tokens:
+    if not has_token(request.user_id):
         return {"success": False, "message": "Please connect your Google account first"}
     if request.job_id not in jobs:
         return {"success": False, "message": "Job not found"}
-
     leads = jobs[request.job_id].get("leads", [])
     if not leads:
         return {"success": False, "message": "No leads to sync"}
-
     try:
-        client = get_gspread_client(request.user_id)
-        added, title = write_leads_to_sheet(
-            client, request.sheet_url, leads, request.sheet_name)
-        return {
-            "success": True,
-            "added": added,
-            "message": f"✅ {added} leads synced to '{title}'"
-        }
+        client      = get_gspread_client(request.user_id)
+        added, title = write_leads_to_sheet(client, request.sheet_url, leads, request.sheet_name)
+        return {"success": True, "added": added,
+                "message": f"✅ {added} leads synced to '{title}'"}
     except Exception as e:
         return {"success": False, "message": f"Error: {e}"}
 
