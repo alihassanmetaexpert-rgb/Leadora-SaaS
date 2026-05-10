@@ -132,8 +132,9 @@ def get_nearby(city):
 # ── Chrome driver (alias to new fast builder) ─────────────────────────────────
 
 def build_driver():
-    """Main visible Chrome for URL collection."""
+    """Main Chrome — headless on Railway, visible locally."""
     is_railway = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RAILWAY_ENVIRONMENT")
+    return _make_chrome(headless=bool(is_railway))
 
 # ── FAST ENGINE — Complete Rewrite ───────────────────────────────────────────
 # Root causes of slowness fixed:
