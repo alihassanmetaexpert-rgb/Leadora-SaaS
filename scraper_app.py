@@ -188,7 +188,7 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--blink-settings=imagesEnabled=false")  # block images
-    if os.path.exists("/usr/bin/chromium"):, ["enable-automation","enable-logging"])
+    if os.path.exists("/usr/bin/chromium"):
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
