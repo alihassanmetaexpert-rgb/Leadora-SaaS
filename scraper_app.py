@@ -189,6 +189,8 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--blink-settings=imagesEnabled=false")  # block images
     if os.path.exists("/usr/bin/chromium"):
+        opts.binary_location = "/usr/bin/chromium"
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
@@ -200,8 +202,10 @@ def _make_chrome(headless=False):
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
-    import shutil    = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=import shutil, options=opts)
+    import shutil
+    chromedriver_path = shutil.which("chromedriver") or "/usr/bin/chromedriver"
+    svc    = Service(chromedriver_path)
+    driver = webdriver.Chrome(service=svc, options=opts)
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source":
         "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
