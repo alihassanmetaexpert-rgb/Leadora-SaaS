@@ -245,10 +245,11 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         log(f"🎯 Target: {request.limit} leads")
         log("=" * 50)
 
+        # Single-driver mode — no WorkerPool to avoid Railway OOM crash
         from scraper_app import (
-            build_driver, collect_urls_fast, scrape_parallel,
-            find_emails_parallel, export_excel, WorkerPool,
-            get_related, get_nearby, DETAIL_WORKERS, SAVE_FOLDER,
+            build_driver, collect_urls_fast, scrape_listing_fast,
+            find_emails_parallel, export_excel,
+            get_related, get_nearby, SAVE_FOLDER,
         )
 
         all_leads   = []
@@ -280,16 +281,11 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             return added
 
         driver = None
-        pool   = None
 
         try:
             log("\n🌐 Starting Chrome browser...")
             driver = build_driver()
-            log("✓ Chrome ready")
-
-            log(f"✓ Single-driver mode (Railway memory safe)\n")
-            pool.start(log)
-            log(f"✓ {DETAIL_WORKERS} parallel workers ready\n")
+            log("✓ Chrome ready (single-driver mode — Railway memory safe)\n")
 
             def run_source(q, c, needed, label, src_tag):
                 jobs[job_id]["current_source"] = f"{label}: {q} in {c}"
@@ -299,22 +295,24 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 if not urls:
                     log("   No results found")
                     return 0
-                log(f"   Scraping {len(urls)} listings ({DETAIL_WORKERS} parallel)...")
-
-                def status_cb(done, total, found):
+                log(f"   Scraping {len(urls)} listings (sequential)...")
+                batch = []
+                for i, url in enumerate(urls, 1):
+                    if jobs[job_id].get("cancelled"):
+                        break
                     jobs[job_id]["status"] = (
-                        f"Scraping {done}/{total} — {len(all_leads)+found} leads found"
+                        f"Scraping {i}/{len(urls)} — {len(all_leads)} leads found"
                     )
-
-                batch = scrape_parallel(
-                    urls, pool, log, status_cb,
-                    lambda: jobs[job_id].get("cancelled", False)
-                )
+                    d = scrape_listing_fast(driver, url)
+                    if d.get("name"):
+                        batch.append(d)
                 return add(batch, src_tag)
 
+            # ── Source 1: Primary ─────────────────────────────────────────────
             n = run_source(request.query, request.city, request.limit, "Primary", "Google Maps")
             log(f"✓ +{n} leads  |  total: {len(all_leads)}/{request.limit}  |  {time.time()-t0:.1f}s")
 
+            # ── Source 2: Related terms ───────────────────────────────────────
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
                 related = get_related(request.query)
                 log(f"\n🔄 Trying {len(related)} related search terms...")
@@ -325,6 +323,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                                    f"Related-{i}", f"Google Maps ({term})")
                     log(f"   +{n}  total: {len(all_leads)}/{request.limit}")
 
+            # ── Source 3: Nearby cities ───────────────────────────────────────
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
                 nearby = get_nearby(request.city)
                 if nearby:
@@ -339,11 +338,10 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
 
         finally:
             if driver:
-                try: driver.quit()
-                except: pass
-            if pool:
-                try: pool.quit()
-                except: pass
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
         if not all_leads:
             log("\n❌ No leads found. Try a different search or city.")
@@ -353,6 +351,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
 
         log(f"\n✓ Scraping done: {len(all_leads)} leads in {time.time()-t0:.1f}s")
 
+        # ── Find emails ───────────────────────────────────────────────────────
         if request.find_emails and not jobs[job_id].get("cancelled"):
             log(f"\n✉  Finding emails...")
             jobs[job_id]["current_source"] = "Finding emails..."
@@ -362,10 +361,14 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                     log(f"  ✉ {name} → {email}")
                 jobs[job_id]["leads"] = all_leads.copy()
 
-            find_emails_parallel(all_leads, email_upd,
-                                 lambda: jobs[job_id].get("cancelled", False))
+            find_emails_parallel(
+                all_leads, log,
+                email_upd,
+                lambda: jobs[job_id].get("cancelled", False)
+            )
             log(f"✓ Email search done")
 
+        # ── Sync to Google Sheets ─────────────────────────────────────────────
         sheets_added = 0
         if request.sheet_url and request.user_id and has_token(request.user_id):
             log(f"\n📊 Syncing to Google Sheets...")
@@ -378,7 +381,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             except Exception as e:
                 log(f"⚠️  Sheets sync failed: {e}")
 
-        jobs[job_id]["sheets_added"]   = sheets_added
+        jobs[job_id]["sheets_added"] = sheets_added
         elapsed = time.time() - t0
         log(f"\n{'=' * 50}")
         log(f"✅ DONE in {elapsed:.1f}s!")
