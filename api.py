@@ -424,8 +424,8 @@ def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="query cannot be empty")
     if not request.city.strip():
         raise HTTPException(status_code=400, detail="city cannot be empty")
-    if request.limit < 1 or request.limit > 200:
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    if request.limit < 1 or request.limit > 500:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
 
     job_id = str(uuid.uuid4())[:12]
     jobs[job_id] = {
