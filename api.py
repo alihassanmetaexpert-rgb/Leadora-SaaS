@@ -287,7 +287,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             driver = build_driver()
             log("✓ Chrome ready")
 
-            pool = WorkerPool(size=DETAIL_WORKERS)
+            log(f"✓ Single-driver mode (Railway memory safe)\n")
             pool.start(log)
             log(f"✓ {DETAIL_WORKERS} parallel workers ready\n")
 
