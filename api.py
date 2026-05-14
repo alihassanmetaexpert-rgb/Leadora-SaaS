@@ -1,20 +1,21 @@
 """
-Leadora — FastAPI Backend
+Leadora — FastAPI Backend v2.0
 =================================
-Google Maps Lead Generation + Google Sheets OAuth
-Tokens stored in Redis for persistence across restarts.
+Google Maps Lead Generation + Google Sheets OAuth + Paddle Subscriptions
+Tokens and plans stored in Redis for persistence across restarts.
 """
 
 import os
-import sys
 import uuid
 import json
+import hashlib
+import hmac
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -37,6 +38,25 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
+# ── Paddle config ─────────────────────────────────────────────────────────────
+# Add these in Railway environment variables after Paddle approval
+PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")
+
+# Map Paddle Price IDs → plan keys (fill in after creating products in Paddle)
+PADDLE_PRICE_MAP = {
+    # "pri_xxxxxxxx": "basic",
+    # "pri_xxxxxxxx": "pro",
+    # "pri_xxxxxxxx": "agency",
+}
+
+# ── Plan definitions ──────────────────────────────────────────────────────────
+PLANS = {
+    "free_trial": {"name": "Free Trial", "leads_limit": 50,   "monthly": False, "price": 0},
+    "basic":      {"name": "Basic",      "leads_limit": 300,  "monthly": True,  "price": 19},
+    "pro":        {"name": "Pro",        "leads_limit": 1000, "monthly": True,  "price": 49},
+    "agency":     {"name": "Agency",     "leads_limit": 5000, "monthly": True,  "price": 99},
+}
+
 # ── Redis setup ───────────────────────────────────────────────────────────────
 import redis as redis_lib
 
@@ -56,25 +76,81 @@ def delete_token(user_id: str):
 def has_token(user_id: str) -> bool:
     return redis_client.exists(f"token:{user_id}") > 0
 
+# ── Plan helpers ──────────────────────────────────────────────────────────────
+
+def get_user_plan(user_id: str) -> dict:
+    data = redis_client.get(f"plan:{user_id}")
+    if data:
+        return json.loads(data)
+    return {
+        "plan": "free_trial", "leads_used": 0, "leads_limit": 50,
+        "monthly": False, "subscription_id": None,
+        "activated_at": datetime.now(timezone.utc).isoformat(), "status": "active",
+    }
+
+def save_user_plan(user_id: str, plan_data: dict):
+    redis_client.set(f"plan:{user_id}", json.dumps(plan_data), ex=60*60*24*400)
+
+def get_month_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+def get_leads_used_this_month(user_id: str) -> int:
+    val = redis_client.get(f"usage:{user_id}:{get_month_key()}")
+    return int(val) if val else 0
+
+def add_leads_used(user_id: str, count: int):
+    plan_data = get_user_plan(user_id)
+    if plan_data["plan"] == "free_trial":
+        plan_data["leads_used"] = plan_data.get("leads_used", 0) + count
+        save_user_plan(user_id, plan_data)
+    else:
+        key = f"usage:{user_id}:{get_month_key()}"
+        redis_client.incr(key, count)
+        redis_client.expire(key, 60*60*24*35)
+
+def get_leads_remaining(user_id: str) -> int:
+    plan_data = get_user_plan(user_id)
+    limit = PLANS[plan_data["plan"]]["leads_limit"]
+    used  = plan_data.get("leads_used", 0) if plan_data["plan"] == "free_trial" else get_leads_used_this_month(user_id)
+    return max(0, limit - used)
+
+def check_plan_limit(user_id: str, requested: int):
+    if not user_id:
+        return True, ""
+    plan_data  = get_user_plan(user_id)
+    plan_key   = plan_data["plan"]
+    limit      = PLANS[plan_key]["leads_limit"]
+    remaining  = get_leads_remaining(user_id)
+    if remaining <= 0:
+        msg = f"Free trial limit reached ({limit} leads total). Please upgrade to continue." if plan_key == "free_trial" else f"Monthly limit reached ({limit} leads). Resets next month or upgrade your plan."
+        return False, msg
+    if requested > remaining:
+        period = "trial" if plan_key == "free_trial" else "month"
+        return False, f"You only have {remaining} leads remaining this {period}. Reduce your request or upgrade your plan."
+    return True, ""
+
+def activate_plan(user_id: str, plan_key: str, subscription_id: str = None):
+    if plan_key not in PLANS:
+        raise ValueError(f"Unknown plan: {plan_key}")
+    plan_data = {
+        "plan": plan_key, "leads_used": 0,
+        "leads_limit": PLANS[plan_key]["leads_limit"],
+        "monthly": PLANS[plan_key]["monthly"],
+        "subscription_id": subscription_id,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+        "status": "active",
+    }
+    save_user_plan(user_id, plan_data)
+    return plan_data
+
 # ── In-memory job store ───────────────────────────────────────────────────────
 jobs: dict = {}
 
-# ── App setup ─────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Leadora API",
-    description="Google Maps Lead Generation API",
-    version="1.0.0"
-)
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Leadora API", description="Google Maps Lead Generation API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Request models ────────────────────────────────────────────────────────────
+# ── Models ────────────────────────────────────────────────────────────────────
 
 class ScrapeRequest(BaseModel):
     query: str
@@ -96,68 +172,51 @@ class SheetSyncRequest(BaseModel):
     job_id: str
     sheet_name: str = "Leads"
 
-# ── Google OAuth helpers ──────────────────────────────────────────────────────
+class ActivatePlanRequest(BaseModel):
+    user_id: str
+    plan: str
+    subscription_id: Optional[str] = None
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
 
 def get_google_auth_url(user_id: str) -> str:
     from urllib.parse import urlencode
     params = {
-        "client_id":     GOOGLE_CLIENT_ID,
-        "redirect_uri":  REDIRECT_URI,
-        "response_type": "code",
-        "scope":         " ".join(SCOPES),
-        "access_type":   "offline",
-        "prompt":        "consent",
-        "state":         user_id,
+        "client_id": GOOGLE_CLIENT_ID, "redirect_uri": REDIRECT_URI,
+        "response_type": "code", "scope": " ".join(SCOPES),
+        "access_type": "offline", "prompt": "consent", "state": user_id,
     }
     return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
 
-
 def exchange_code_for_token(code: str) -> dict:
     import requests
-    resp = requests.post("https://oauth2.googleapis.com/token", data={
-        "code":          code,
-        "client_id":     GOOGLE_CLIENT_ID,
+    return requests.post("https://oauth2.googleapis.com/token", data={
+        "code": code, "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uri":  REDIRECT_URI,
-        "grant_type":    "authorization_code",
-    })
-    return resp.json()
-
+        "redirect_uri": REDIRECT_URI, "grant_type": "authorization_code",
+    }).json()
 
 def get_gspread_client(user_id: str):
     import gspread
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request as GRequest
-
     token_data = get_token(user_id)
     if not token_data:
         raise Exception("not_authenticated")
-
     creds = Credentials(
-        token=token_data.get("access_token"),
-        refresh_token=token_data.get("refresh_token"),
+        token=token_data.get("access_token"), refresh_token=token_data.get("refresh_token"),
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
+        client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET, scopes=SCOPES,
     )
-
     if not creds.valid and creds.refresh_token:
         creds.refresh(GRequest())
         token_data["access_token"] = creds.token
         save_token(user_id, token_data)
-
     return gspread.authorize(creds)
 
+# ── Sheets ────────────────────────────────────────────────────────────────────
 
-# ── Sheet helpers ─────────────────────────────────────────────────────────────
-
-SHEET_HEADERS = [
-    "Name", "Category", "City", "Address",
-    "Phone", "Email", "Website", "Rating",
-    "Source", "Maps URL", "Date Added"
-]
-
+SHEET_HEADERS = ["Name","Category","City","Address","Phone","Email","Website","Rating","Source","Maps URL","Date Added"]
 
 def extract_sheet_id(url: str) -> str:
     import re
@@ -169,60 +228,41 @@ def extract_sheet_id(url: str) -> str:
         return match.group(1)
     raise Exception("Invalid Google Sheet URL")
 
-
 def write_leads_to_sheet(client, sheet_url: str, leads: list, sheet_name: str = "Leads"):
     sheet_id    = extract_sheet_id(sheet_url)
     spreadsheet = client.open_by_key(sheet_id)
-
     try:
         ws = spreadsheet.worksheet(sheet_name)
     except Exception:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=5000, cols=15)
-
     first_row = ws.row_values(1)
     if not first_row or first_row[0] != "Name":
         ws.insert_row(SHEET_HEADERS, index=1)
         ws.format("A1:K1", {
-            "textFormat": {"bold": True, "fontSize": 11,
-                           "foregroundColor": {"red": 1, "green": 1, "blue": 1}},
-            "backgroundColor": {"red": 0.102, "green": 0.451, "blue": 0.910},
+            "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": {"red":1,"green":1,"blue":1}},
+            "backgroundColor": {"red":0.102,"green":0.451,"blue":0.910},
             "horizontalAlignment": "CENTER"
         })
-
     existing      = ws.get_all_values()
-    existing_keys = {(r[0].strip().lower(), r[4].strip())
-                     for r in existing[1:] if len(r) >= 5}
-
+    existing_keys = {(r[0].strip().lower(), r[4].strip()) for r in existing[1:] if len(r) >= 5}
     now  = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
     for lead in leads:
-        name  = str(lead.get("name", "")).strip()
-        phone = str(lead.get("phone", "")).strip()
+        name  = str(lead.get("name","")).strip()
+        phone = str(lead.get("phone","")).strip()
         key   = (name.lower(), phone)
         if key in existing_keys:
             continue
         existing_keys.add(key)
-        rows.append([
-            name,
-            str(lead.get("category", "")),
-            str(lead.get("city", "")),
-            str(lead.get("address", "")),
-            phone,
-            str(lead.get("email", "")),
-            str(lead.get("website", "")),
-            str(lead.get("rating", "")),
-            str(lead.get("source", "Google Maps")),
-            str(lead.get("maps_url", "")),
-            now,
-        ])
-
+        rows.append([name, str(lead.get("category","")), str(lead.get("city","")),
+                     str(lead.get("address","")), phone, str(lead.get("email","")),
+                     str(lead.get("website","")), str(lead.get("rating","")),
+                     str(lead.get("source","Google Maps")), str(lead.get("maps_url","")), now])
     if rows:
         for i in range(0, len(rows), 50):
             ws.append_rows(rows[i:i+50], value_input_option="RAW")
             time.sleep(0.5)
-
     return len(rows), spreadsheet.title
-
 
 # ── Log collector ─────────────────────────────────────────────────────────────
 
@@ -232,12 +272,10 @@ def make_log_collector(job_id: str):
             jobs[job_id]["logs"].append(str(msg))
     return log
 
-
 # ── Scrape job ────────────────────────────────────────────────────────────────
 
 def run_scrape_job(job_id: str, request: ScrapeRequest):
     log = make_log_collector(job_id)
-
     try:
         jobs[job_id]["status"]     = "running"
         jobs[job_id]["started_at"] = datetime.now().isoformat()
@@ -245,11 +283,9 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         log(f"🎯 Target: {request.limit} leads")
         log("=" * 50)
 
-        # Single-driver mode — no WorkerPool to avoid Railway OOM crash
         from scraper_app import (
             build_driver, collect_urls_fast, scrape_listing_fast,
-            find_emails_parallel, export_excel,
-            get_related, get_nearby, SAVE_FOLDER,
+            find_emails_parallel, export_excel, get_related, get_nearby, SAVE_FOLDER,
         )
 
         all_leads   = []
@@ -262,8 +298,8 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             for lead in new_leads:
                 if len(all_leads) >= request.limit:
                     break
-                name  = lead.get("name", "").strip().lower()
-                phone = lead.get("phone", "").strip()
+                name  = lead.get("name","").strip().lower()
+                phone = lead.get("phone","").strip()
                 if not name or name in seen_names:
                     continue
                 if phone and phone in seen_phones:
@@ -274,22 +310,20 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 lead["source"] = src_tag
                 all_leads.append(lead)
                 added += 1
-                log(f"  [{len(all_leads)}/{request.limit}] ✓ {lead['name']}" +
-                    (f"  |  {phone}" if phone else ""))
+                log(f"  [{len(all_leads)}/{request.limit}] ✓ {lead['name']}" + (f"  |  {phone}" if phone else ""))
                 jobs[job_id]["leads_found"] = len(all_leads)
                 jobs[job_id]["leads"]       = all_leads.copy()
             return added
 
         driver = None
-
         try:
             log("\n🌐 Starting Chrome browser...")
             driver = build_driver()
-            log("✓ Chrome ready (single-driver mode — Railway memory safe)\n")
+            log("✓ Chrome ready (single-driver mode)\n")
 
             def run_source(q, c, needed, label, src_tag):
                 jobs[job_id]["current_source"] = f"{label}: {q} in {c}"
-                log(f"{'─' * 40}")
+                log(f"{'─'*40}")
                 log(f"🔍 {label}: '{q}' in '{c}'")
                 urls = collect_urls_fast(driver, q, c, needed, log, label)
                 if not urls:
@@ -300,30 +334,24 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 for i, url in enumerate(urls, 1):
                     if jobs[job_id].get("cancelled"):
                         break
-                    jobs[job_id]["status"] = (
-                        f"Scraping {i}/{len(urls)} — {len(all_leads)} leads found"
-                    )
+                    jobs[job_id]["status"] = f"Scraping {i}/{len(urls)} — {len(all_leads)} leads found"
                     d = scrape_listing_fast(driver, url)
                     if d.get("name"):
                         batch.append(d)
                 return add(batch, src_tag)
 
-            # ── Source 1: Primary ─────────────────────────────────────────────
             n = run_source(request.query, request.city, request.limit, "Primary", "Google Maps")
             log(f"✓ +{n} leads  |  total: {len(all_leads)}/{request.limit}  |  {time.time()-t0:.1f}s")
 
-            # ── Source 2: Related terms ───────────────────────────────────────
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
                 related = get_related(request.query)
                 log(f"\n🔄 Trying {len(related)} related search terms...")
                 for i, term in enumerate(related, 1):
                     if len(all_leads) >= request.limit or jobs[job_id].get("cancelled"):
                         break
-                    n = run_source(term, request.city, request.limit - len(all_leads),
-                                   f"Related-{i}", f"Google Maps ({term})")
+                    n = run_source(term, request.city, request.limit - len(all_leads), f"Related-{i}", f"Google Maps ({term})")
                     log(f"   +{n}  total: {len(all_leads)}/{request.limit}")
 
-            # ── Source 3: Nearby cities ───────────────────────────────────────
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
                 nearby = get_nearby(request.city)
                 if nearby:
@@ -331,17 +359,12 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                     for i, nc in enumerate(nearby, 1):
                         if len(all_leads) >= request.limit or jobs[job_id].get("cancelled"):
                             break
-                        n = run_source(request.query, nc,
-                                       request.limit - len(all_leads),
-                                       f"Nearby-{i}", f"Google Maps ({nc})")
+                        n = run_source(request.query, nc, request.limit - len(all_leads), f"Nearby-{i}", f"Google Maps ({nc})")
                         log(f"   +{n}  total: {len(all_leads)}/{request.limit}")
-
         finally:
             if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+                try: driver.quit()
+                except: pass
 
         if not all_leads:
             log("\n❌ No leads found. Try a different search or city.")
@@ -351,31 +374,30 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
 
         log(f"\n✓ Scraping done: {len(all_leads)} leads in {time.time()-t0:.1f}s")
 
-        # ── Find emails ───────────────────────────────────────────────────────
+        # Track usage
+        if request.user_id:
+            add_leads_used(request.user_id, len(all_leads))
+            remaining = get_leads_remaining(request.user_id)
+            log(f"📊 Plan usage updated — {remaining} leads remaining this period")
+
+        # Find emails
         if request.find_emails and not jobs[job_id].get("cancelled"):
             log(f"\n✉  Finding emails...")
             jobs[job_id]["current_source"] = "Finding emails..."
-
             def email_upd(name, email, done, total):
                 if email:
                     log(f"  ✉ {name} → {email}")
                 jobs[job_id]["leads"] = all_leads.copy()
-
-            find_emails_parallel(
-                all_leads, log,
-                email_upd,
-                lambda: jobs[job_id].get("cancelled", False)
-            )
+            find_emails_parallel(all_leads, log, email_upd, lambda: jobs[job_id].get("cancelled", False))
             log(f"✓ Email search done")
 
-        # ── Sync to Google Sheets ─────────────────────────────────────────────
+        # Sync to sheets
         sheets_added = 0
         if request.sheet_url and request.user_id and has_token(request.user_id):
-            log(f"\n📊 Syncing to Google Sheets...")
+            log(f"\n📊 Syncing {len(all_leads)} leads to Google Sheets...")
             try:
                 client = get_gspread_client(request.user_id)
-                added, title = write_leads_to_sheet(
-                    client, request.sheet_url, all_leads, request.sheet_name)
+                added, title = write_leads_to_sheet(client, request.sheet_url, all_leads, request.sheet_name)
                 sheets_added = added
                 log(f"✅ {added} leads added to '{title}'!")
             except Exception as e:
@@ -383,7 +405,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
 
         jobs[job_id]["sheets_added"] = sheets_added
         elapsed = time.time() - t0
-        log(f"\n{'=' * 50}")
+        log(f"\n{'='*50}")
         log(f"✅ DONE in {elapsed:.1f}s!")
         log(f"📊 Total leads  : {len(all_leads)}")
         log(f"📞 With phone   : {sum(1 for l in all_leads if l.get('phone'))}")
@@ -405,18 +427,11 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"]  = str(e)
 
-
-# ── API Routes ────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
-    return {
-        "status": "online",
-        "app": "Leadora API",
-        "version": "1.0.0",
-        "message": "API is running! Send POST /scrape to start."
-    }
-
+    return {"status":"online","app":"Leadora API","version":"2.0.0","message":"API is running!"}
 
 @app.post("/scrape")
 def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
@@ -427,26 +442,20 @@ def start_scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
     if request.limit < 1 or request.limit > 500:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
 
+    if request.user_id:
+        allowed, error_msg = check_plan_limit(request.user_id, request.limit)
+        if not allowed:
+            raise HTTPException(status_code=403, detail=error_msg)
+
     job_id = str(uuid.uuid4())[:12]
     jobs[job_id] = {
-        "job_id": job_id, "status": "queued",
-        "query": request.query, "city": request.city,
-        "limit": request.limit, "leads_found": 0,
-        "leads": [], "logs": [], "current_source": "",
-        "excel_file": None, "sheets_added": 0,
-        "cancelled": False, "created_at": datetime.now().isoformat(),
-        "started_at": None, "completed_at": None, "error": None,
+        "job_id":job_id,"status":"queued","query":request.query,"city":request.city,
+        "limit":request.limit,"leads_found":0,"leads":[],"logs":[],"current_source":"",
+        "excel_file":None,"sheets_added":0,"cancelled":False,
+        "created_at":datetime.now().isoformat(),"started_at":None,"completed_at":None,"error":None,
     }
-
-    thread = threading.Thread(target=run_scrape_job, args=(job_id, request), daemon=True)
-    thread.start()
-
-    return {
-        "job_id": job_id,
-        "message": f"Job started! Searching for {request.query} in {request.city}",
-        "poll_url": f"/job/{job_id}"
-    }
-
+    threading.Thread(target=run_scrape_job, args=(job_id, request), daemon=True).start()
+    return {"job_id":job_id,"message":f"Job started! Searching for {request.query} in {request.city}","poll_url":f"/job/{job_id}"}
 
 @app.get("/job/{job_id}")
 def get_job(job_id: str):
@@ -454,27 +463,19 @@ def get_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     job = jobs[job_id]
     return {
-        "job_id": job_id, "status": job["status"],
-        "query": job["query"], "city": job["city"],
-        "leads_found": job["leads_found"],
-        "current_source": job.get("current_source", ""),
-        "logs": job["logs"][-30:], "leads": job["leads"],
-        "excel_file": job.get("excel_file"),
-        "sheets_added": job.get("sheets_added", 0),
-        "error": job.get("error"),
-        "created_at": job["created_at"],
-        "completed_at": job.get("completed_at"),
+        "job_id":job_id,"status":job["status"],"query":job["query"],"city":job["city"],
+        "leads_found":job["leads_found"],"current_source":job.get("current_source",""),
+        "logs":job["logs"][-30:],"leads":job["leads"],"excel_file":job.get("excel_file"),
+        "sheets_added":job.get("sheets_added",0),"error":job.get("error"),
+        "created_at":job["created_at"],"completed_at":job.get("completed_at"),
     }
-
 
 @app.get("/job/{job_id}/logs")
 def get_logs(job_id: str, from_line: int = 0):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     logs_list = jobs[job_id]["logs"]
-    return {"logs": logs_list[from_line:], "total_lines": len(logs_list),
-            "status": jobs[job_id]["status"]}
-
+    return {"logs":logs_list[from_line:],"total_lines":len(logs_list),"status":jobs[job_id]["status"]}
 
 @app.post("/job/{job_id}/cancel")
 def cancel_job(job_id: str):
@@ -482,27 +483,99 @@ def cancel_job(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     jobs[job_id]["cancelled"] = True
     jobs[job_id]["status"]    = "cancelled"
-    return {"message": "Job cancelled"}
-
+    return {"message":"Job cancelled"}
 
 @app.delete("/job/{job_id}")
 def delete_job(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     del jobs[job_id]
-    return {"message": "Job deleted"}
-
+    return {"message":"Job deleted"}
 
 @app.get("/jobs")
 def list_jobs():
-    return [
-        {"job_id": jid, "status": j["status"], "query": j["query"],
-         "city": j["city"], "leads_found": j["leads_found"], "created_at": j["created_at"]}
-        for jid, j in jobs.items()
-    ]
+    return [{"job_id":jid,"status":j["status"],"query":j["query"],"city":j["city"],"leads_found":j["leads_found"],"created_at":j["created_at"]} for jid,j in jobs.items()]
 
+# ── Plan routes ───────────────────────────────────────────────────────────────
 
-# ── Google OAuth Routes ───────────────────────────────────────────────────────
+@app.get("/plans")
+def list_plans():
+    return {k: {"name":v["name"],"leads_limit":v["leads_limit"],"price":v["price"],"monthly":v["monthly"]} for k,v in PLANS.items()}
+
+@app.get("/user/{user_id}/plan")
+def get_plan(user_id: str):
+    plan_data = get_user_plan(user_id)
+    plan_key  = plan_data["plan"]
+    limit     = PLANS[plan_key]["leads_limit"]
+    used      = plan_data.get("leads_used",0) if plan_key == "free_trial" else get_leads_used_this_month(user_id)
+    remaining = max(0, limit - used)
+    return {
+        "user_id":user_id,"plan":plan_key,"plan_name":PLANS[plan_key]["name"],
+        "leads_limit":limit,"leads_used":used,"leads_remaining":remaining,
+        "monthly":PLANS[plan_key]["monthly"],"status":plan_data.get("status","active"),
+        "activated_at":plan_data.get("activated_at"),"subscription_id":plan_data.get("subscription_id"),
+        "reset_info":"Resets monthly" if plan_key != "free_trial" else "Lifetime limit",
+    }
+
+@app.post("/user/activate-plan")
+def activate_user_plan(request: ActivatePlanRequest):
+    try:
+        plan_data = activate_plan(request.user_id, request.plan, request.subscription_id)
+        return {"success":True,"message":f"Plan '{request.plan}' activated for {request.user_id}","plan_data":plan_data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# ── Paddle webhook ────────────────────────────────────────────────────────────
+
+@app.post("/webhook/paddle")
+async def paddle_webhook(request: Request):
+    body = await request.body()
+
+    if PADDLE_WEBHOOK_SECRET:
+        sig_header = request.headers.get("Paddle-Signature","")
+        try:
+            parts    = dict(p.split("=",1) for p in sig_header.split(";"))
+            ts       = parts.get("ts","")
+            h1       = parts.get("h1","")
+            signed   = f"{ts}:{body.decode()}"
+            expected = hmac.new(PADDLE_WEBHOOK_SECRET.encode(), signed.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(h1, expected):
+                raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        except Exception:
+            raise HTTPException(status_code=401, detail="Webhook verification failed")
+
+    try:
+        payload    = json.loads(body)
+        event_type = payload.get("event_type","")
+        data       = payload.get("data",{})
+        custom_data     = data.get("custom_data",{})
+        user_id         = custom_data.get("user_id","")
+        subscription_id = data.get("id","")
+        items    = data.get("items",[])
+        price_id = items[0].get("price",{}).get("id","") if items else ""
+        plan_key = PADDLE_PRICE_MAP.get(price_id,"")
+
+        if not user_id:
+            return {"status":"ignored","reason":"no user_id in custom_data"}
+
+        if event_type in ("subscription.activated","subscription.updated"):
+            if plan_key:
+                activate_plan(user_id, plan_key, subscription_id)
+                return {"status":"ok","action":f"activated {plan_key} for {user_id}"}
+        elif event_type == "subscription.canceled":
+            activate_plan(user_id, "free_trial", None)
+            return {"status":"ok","action":f"downgraded {user_id} to free_trial"}
+        elif event_type == "subscription.past_due":
+            plan_data = get_user_plan(user_id)
+            plan_data["status"] = "past_due"
+            save_user_plan(user_id, plan_data)
+            return {"status":"ok","action":"marked past_due"}
+
+        return {"status":"ignored","event_type":event_type}
+    except Exception as e:
+        return JSONResponse({"error":str(e)}, status_code=500)
+
+# ── Auth routes ───────────────────────────────────────────────────────────────
 
 @app.get("/auth/login")
 def auth_login(user_id: str):
@@ -510,78 +583,64 @@ def auth_login(user_id: str):
         raise HTTPException(status_code=500, detail="Google OAuth not configured")
     return {"auth_url": get_google_auth_url(user_id)}
 
-
 @app.get("/auth/callback")
 def auth_callback(code: str, state: str):
     try:
         token_data = exchange_code_for_token(code)
         save_token(state, token_data)
-        frontend_url = f"https://mapseeker-spark.lovable.app/dashboard?sheets_connected=true&user_id={state}"
-        return RedirectResponse(url=frontend_url)
+        return RedirectResponse(url=f"https://mapseeker-spark.lovable.app/dashboard?sheets_connected=true&user_id={state}")
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
+        return JSONResponse({"error":str(e)}, status_code=500)
 
 @app.get("/auth/status/{user_id}")
 def auth_status(user_id: str):
     connected = has_token(user_id)
-    return {
-        "user_id": user_id,
-        "authenticated": connected,
-        "message": "Google account connected ✅" if connected else "Not connected"
-    }
-
+    return {"user_id":user_id,"authenticated":connected,"message":"Google account connected ✅" if connected else "Not connected"}
 
 @app.post("/auth/revoke/{user_id}")
 def auth_revoke(user_id: str):
     if has_token(user_id):
         delete_token(user_id)
-        return {"success": True, "message": "Google account disconnected"}
-    return {"success": False, "message": "No account was connected"}
+        return {"success":True,"message":"Google account disconnected"}
+    return {"success":False,"message":"No account was connected"}
 
-
-# ── Google Sheets Routes ──────────────────────────────────────────────────────
+# ── Sheets routes ─────────────────────────────────────────────────────────────
 
 @app.post("/sheets/test")
 def test_sheet(request: SheetTestRequest):
     if not has_token(request.user_id):
-        return {"success": False, "message": "Please connect your Google account first"}
+        return {"success":False,"message":"Please connect your Google account first"}
     try:
         client      = get_gspread_client(request.user_id)
-        sheet_id    = extract_sheet_id(request.sheet_url)
-        spreadsheet = client.open_by_key(sheet_id)
-        return {"success": True, "message": f"Connected to '{spreadsheet.title}' ✅",
-                "sheet_title": spreadsheet.title}
+        spreadsheet = client.open_by_key(extract_sheet_id(request.sheet_url))
+        return {"success":True,"message":f"Connected to '{spreadsheet.title}' ✅","sheet_title":spreadsheet.title}
     except Exception as e:
         err = str(e)
         if "not_authenticated" in err:
-            return {"success": False, "message": "Please connect your Google account first"}
-        return {"success": False, "message": f"Error: {err}"}
-
+            return {"success":False,"message":"Please connect your Google account first"}
+        return {"success":False,"message":f"Error: {err}"}
 
 @app.post("/sheets/sync")
 def sync_to_sheet(request: SheetSyncRequest):
     if not has_token(request.user_id):
-        return {"success": False, "message": "Please connect your Google account first"}
+        return {"success":False,"message":"Please connect your Google account first"}
     if request.job_id not in jobs:
-        return {"success": False, "message": "Job not found"}
-    leads = jobs[request.job_id].get("leads", [])
+        return {"success":False,"message":"Job not found"}
+    leads = jobs[request.job_id].get("leads",[])
     if not leads:
-        return {"success": False, "message": "No leads to sync"}
+        return {"success":False,"message":"No leads to sync"}
     try:
-        client      = get_gspread_client(request.user_id)
+        client       = get_gspread_client(request.user_id)
         added, title = write_leads_to_sheet(client, request.sheet_url, leads, request.sheet_name)
-        return {"success": True, "added": added,
-                "message": f"✅ {added} leads synced to '{title}'"}
+        return {"success":True,"added":added,"message":f"✅ {added} leads synced to '{title}'"}
     except Exception as e:
-        return {"success": False, "message": f"Error: {e}"}
-
+        return {"success":False,"message":f"Error: {e}"}
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n" + "=" * 55)
-    print("  Leadora API — Starting...")
-    print("=" * 55)
+    print("\n" + "="*55)
+    print("  Leadora API v2.0 — Starting...")
+    print("="*55)
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
