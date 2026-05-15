@@ -636,6 +636,33 @@ def sync_to_sheet(request: SheetSyncRequest):
     except Exception as e:
         return {"success":False,"message":f"Error: {e}"}
 
+@app.get("/sheets/list")
+def list_user_sheets(user_id: str):
+    """
+    Returns a list of all Google Sheets the user has access to.
+    Used by frontend to show a dropdown instead of manual URL paste.
+    """
+    if not has_token(user_id):
+        return {"success": False, "message": "Please connect your Google account first", "sheets": []}
+    try:
+        client = get_gspread_client(user_id)
+        spreadsheets = client.list_spreadsheet_files()
+        sheets = [
+            {
+                "id":    s["id"],
+                "name":  s["name"],
+                "url":   f"https://docs.google.com/spreadsheets/d/{s['id']}",
+            }
+            for s in spreadsheets
+        ]
+        return {"success": True, "sheets": sheets, "count": len(sheets)}
+    except Exception as e:
+        err = str(e)
+        if "not_authenticated" in err:
+            return {"success": False, "message": "Please connect your Google account first", "sheets": []}
+        return {"success": False, "message": f"Error: {err}", "sheets": []}
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
