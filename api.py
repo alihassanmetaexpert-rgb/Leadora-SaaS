@@ -35,7 +35,7 @@ REDIRECT_URI         = f"https://{RAILWAY_URL}/auth/callback"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.readonly",
 ]
 
 # ── Paddle config ─────────────────────────────────────────────────────────────
