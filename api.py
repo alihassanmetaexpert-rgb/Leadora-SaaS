@@ -330,6 +330,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             log("✓ Chrome ready (single-driver mode)\n")
 
             def run_source(q, c, needed, label, src_tag):
+                nonlocal driver
                 jobs[job_id]["current_source"] = f"{label}: {q} in {c}"
                 log(f"{'─'*40}")
                 log(f"🔍 {label}: '{q}' in '{c}'")
@@ -337,15 +338,33 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 if not urls:
                     log("   No results found")
                     return 0
-                log(f"   Scraping {len(urls)} listings (sequential)...")
+                log(f"   Scraping {len(urls)} listings (sequential, batch-safe)...")
                 batch = []
-                for i, url in enumerate(urls, 1):
+                # Process in batches of 25 — restart Chrome if it crashes
+                BATCH = 25
+                for chunk_start in range(0, len(urls), BATCH):
                     if jobs[job_id].get("cancelled"):
                         break
-                    jobs[job_id]["status"] = f"Scraping {i}/{len(urls)} — {len(all_leads)} leads found"
-                    d = scrape_listing_fast(driver, url)
-                    if d.get("name"):
-                        batch.append(d)
+                    chunk = urls[chunk_start:chunk_start + BATCH]
+                    log(f"   Batch {chunk_start//BATCH + 1}: {len(chunk)} listings...")
+                    for i, url in enumerate(chunk, 1):
+                        if jobs[job_id].get("cancelled"):
+                            break
+                        jobs[job_id]["status"] = f"Scraping {chunk_start+i}/{len(urls)} — {len(all_leads)} leads found"
+                        try:
+                            d = scrape_listing_fast(driver, url)
+                            if d.get("name"):
+                                batch.append(d)
+                        except Exception as scrape_err:
+                            log(f"   ⚠ Scrape error: {scrape_err} — restarting Chrome...")
+                            try: driver.quit()
+                            except: pass
+                            try:
+                                driver = build_driver()
+                                log("   ✓ Chrome restarted, continuing...")
+                            except Exception as restart_err:
+                                log(f"   ❌ Chrome restart failed: {restart_err}")
+                                return add(batch, src_tag)
                 return add(batch, src_tag)
 
             n = run_source(request.query, request.city, request.limit, "Primary", "Google Maps")

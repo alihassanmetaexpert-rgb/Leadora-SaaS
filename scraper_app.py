@@ -191,17 +191,17 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--blink-settings=imagesEnabled=false")  # block images
     # Extra memory optimizations for Railway
-    opts.add_argument("--memory-pressure-off")
-    opts.add_argument("--max_old_space_size=256")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-default-apps")
     opts.add_argument("--disable-sync")
     opts.add_argument("--disable-translate")
     opts.add_argument("--hide-scrollbars")
-    opts.add_argument("--metrics-recording-only")
     opts.add_argument("--no-first-run")
     opts.add_argument("--safebrowsing-disable-auto-update")
-    opts.add_argument("--single-process")  # saves ~150MB RAM on Railway
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+    opts.add_argument("--renderer-process-limit=1")
+    opts.add_argument("--js-flags=--max-old-space-size=128")
     if os.path.exists("/usr/bin/chromium"):
         opts.binary_location = "/usr/bin/chromium"
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
