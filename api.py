@@ -1,7 +1,7 @@
 """
-Leadora — FastAPI Backend v2.1
+Leadora — FastAPI Backend v2.0
 =================================
-Google Maps Lead Generation + Google Sheets OAuth + Lemon Squeezy Subscriptions
+Google Maps Lead Generation + Google Sheets OAuth + Paddle Subscriptions
 Tokens and plans stored in Redis for persistence across restarts.
 """
 
@@ -114,13 +114,11 @@ def get_leads_remaining(user_id: str) -> int:
     return max(0, limit - used)
 
 # ── Owner bypass for testing ──────────────────────────────────────────────────
-# Add your actual user_id here to bypass plan limits during testing
-OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "").split(",")  # comma-separated in Railway env
+OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "").split(",")
 
 def check_plan_limit(user_id: str, requested: int):
     if not user_id:
         return True, ""
-    # Bypass for owner/testing accounts
     if user_id.strip() in [uid.strip() for uid in OWNER_USER_IDS if uid.strip()]:
         return True, ""
     plan_data  = get_user_plan(user_id)
@@ -252,8 +250,12 @@ def write_leads_to_sheet(client, sheet_url: str, leads: list, sheet_name: str = 
     existing      = ws.get_all_values()
     existing_keys = {(r[0].strip().lower(), r[4].strip()) for r in existing[1:] if len(r) >= 5}
     now  = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # Sort: leads WITH email first, leads WITHOUT email at the bottom
+    sorted_leads = sorted(leads, key=lambda l: (0 if str(l.get("email","")).strip() else 1))
+
     rows = []
-    for lead in leads:
+    for lead in sorted_leads:
         name  = str(lead.get("name","")).strip()
         phone = str(lead.get("phone","")).strip()
         key   = (name.lower(), phone)
@@ -533,80 +535,62 @@ def activate_user_plan(request: ActivatePlanRequest):
 
 @app.post("/user/{user_id}/reset-usage")
 def reset_user_usage(user_id: str):
-    """Reset leads_used to 0 for testing. Remove this endpoint before public launch."""
+    """Reset leads_used to 0 for testing."""
     plan_data = get_user_plan(user_id)
     plan_data["leads_used"] = 0
     save_user_plan(user_id, plan_data)
-    # Also clear monthly usage key
     redis_client.delete(f"usage:{user_id}:{get_month_key()}")
     return {"success": True, "message": f"Usage reset for {user_id}", "plan": plan_data["plan"]}
 
-# ── Lemon Squeezy webhook ─────────────────────────────────────────────────────
+# ── Paddle webhook ────────────────────────────────────────────────────────────
 
-@app.post("/webhook/lemonsqueezy")
-async def lemonsqueezy_webhook(request: Request):
+@app.post("/webhook/paddle")
+async def paddle_webhook(request: Request):
     body = await request.body()
 
-    # Verify signature
-    if LEMONSQUEEZY_WEBHOOK_SECRET:
-        sig_header = request.headers.get("X-Signature", "")
+    if PADDLE_WEBHOOK_SECRET:
+        sig_header = request.headers.get("Paddle-Signature","")
         try:
-            expected = hmac.new(
-                LEMONSQUEEZY_WEBHOOK_SECRET.encode(),
-                body,
-                hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(sig_header, expected):
+            parts    = dict(p.split("=",1) for p in sig_header.split(";"))
+            ts       = parts.get("ts","")
+            h1       = parts.get("h1","")
+            signed   = f"{ts}:{body.decode()}"
+            expected = hmac.new(PADDLE_WEBHOOK_SECRET.encode(), signed.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(h1, expected):
                 raise HTTPException(status_code=401, detail="Invalid webhook signature")
-        except HTTPException:
-            raise
         except Exception:
             raise HTTPException(status_code=401, detail="Webhook verification failed")
 
     try:
         payload    = json.loads(body)
-        event_name = payload.get("meta", {}).get("event_name", "")
-        data       = payload.get("data", {})
-        attributes = data.get("attributes", {})
-        custom_data     = attributes.get("custom_data", {}) or {}
-        user_id         = custom_data.get("user_id", "")
-        subscription_id = data.get("id", "")
-        variant_id      = str(attributes.get("variant_id", ""))
-        plan_key        = LEMONSQUEEZY_VARIANT_MAP.get(variant_id, "")
-        status          = attributes.get("status", "")
+        event_type = payload.get("event_type","")
+        data       = payload.get("data",{})
+        custom_data     = data.get("custom_data",{})
+        user_id         = custom_data.get("user_id","")
+        subscription_id = data.get("id","")
+        items    = data.get("items",[])
+        price_id = items[0].get("price",{}).get("id","") if items else ""
+        plan_key = PADDLE_PRICE_MAP.get(price_id,"")
 
         if not user_id:
-            return {"status": "ignored", "reason": "no user_id in custom_data"}
+            return {"status":"ignored","reason":"no user_id in custom_data"}
 
-        if event_name in ("subscription_created", "subscription_updated"):
-            if plan_key and status == "active":
+        if event_type in ("subscription.activated","subscription.updated"):
+            if plan_key:
                 activate_plan(user_id, plan_key, subscription_id)
-                return {"status": "ok", "action": f"activated {plan_key} for {user_id}"}
-            return {"status": "ignored", "reason": f"unknown variant_id={variant_id} or status={status}"}
-
-        elif event_name == "subscription_cancelled":
+                return {"status":"ok","action":f"activated {plan_key} for {user_id}"}
+        elif event_type == "subscription.canceled":
             activate_plan(user_id, "free_trial", None)
-            return {"status": "ok", "action": f"downgraded {user_id} to free_trial"}
-
-        elif event_name == "subscription_expired":
-            activate_plan(user_id, "free_trial", None)
-            return {"status": "ok", "action": f"expired — downgraded {user_id} to free_trial"}
-
-        elif event_name == "subscription_payment_failed":
+            return {"status":"ok","action":f"downgraded {user_id} to free_trial"}
+        elif event_type == "subscription.past_due":
             plan_data = get_user_plan(user_id)
             plan_data["status"] = "past_due"
             save_user_plan(user_id, plan_data)
-            return {"status": "ok", "action": "marked past_due"}
+            return {"status":"ok","action":"marked past_due"}
 
-        return {"status": "ignored", "event_name": event_name}
-
+        return {"status":"ignored","event_type":event_type}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# Keep old /webhook/paddle route as alias so nothing breaks if it's still referenced
-@app.post("/webhook/paddle")
-async def paddle_webhook_alias(request: Request):
-    return await lemonsqueezy_webhook(request)
+        return JSONResponse({"error":str(e)}, status_code=500)
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 
