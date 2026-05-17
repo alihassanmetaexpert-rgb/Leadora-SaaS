@@ -95,32 +95,71 @@ def save_config(cfg):
 # ── Fallback search terms ─────────────────────────────────────────────────────
 
 RELATED_TERMS = {
-    "aesthetic clinic":    ["med spa","skin clinic","beauty clinic","cosmetic clinic","laser clinic"],
-    "real estate agent":   ["real estate agency","property dealer","realtor"],
-    "solar panel company": ["solar energy","solar installer","solar contractor"],
-    "dental clinic":       ["dentist","dental care","orthodontist"],
-    "gym":                 ["fitness center","health club","yoga studio"],
-    "restaurant":          ["cafe","bistro","eatery","diner"],
-    "hotel":               ["motel","inn","resort","lodge"],
-    "law firm":            ["attorney","lawyer","legal services"],
+    "aesthetic clinic":    ["med spa","skin clinic","beauty clinic","cosmetic clinic","laser clinic","dermatology clinic"],
+    "real estate agent":   ["real estate agency","property dealer","realtor","property management","real estate broker"],
+    "solar panel company": ["solar energy company","solar installer","solar contractor","solar power company","renewable energy"],
+    "dental clinic":       ["dentist","dental care","orthodontist","dental office","teeth whitening","pediatric dentist"],
+    "gym":                 ["fitness center","health club","yoga studio","crossfit","pilates studio","personal trainer"],
+    "restaurant":          [
+        "italian restaurant","chinese restaurant","mexican restaurant",
+        "indian restaurant","sushi restaurant","thai restaurant",
+        "french restaurant","japanese restaurant","korean restaurant",
+        "mediterranean restaurant","american restaurant","seafood restaurant",
+        "steakhouse","pizza restaurant","burger restaurant",
+        "vegan restaurant","bbq restaurant","greek restaurant",
+        "vietnamese restaurant","turkish restaurant",
+    ],
+    "hotel":               ["motel","inn","resort","lodge","boutique hotel","bed and breakfast"],
+    "law firm":            ["attorney","lawyer","legal services","law office","legal firm"],
+    "marketing agency":    ["digital marketing agency","social media agency","seo agency","advertising agency","branding agency"],
+    "dental":              ["dentist","orthodontist","dental care","dental office","oral surgeon"],
+    "plumber":             ["plumbing service","plumbing contractor","pipe repair","drain cleaning","emergency plumber"],
+    "electrician":         ["electrical contractor","electrical service","electrical repair","licensed electrician"],
+    "accountant":          ["accounting firm","cpa","tax consultant","bookkeeper","financial advisor","tax preparer"],
+    "hair salon":          ["hair stylist","barbershop","beauty salon","hair color","hair extensions","blow dry bar"],
+    "auto repair":         ["auto mechanic","car repair","auto service","tire shop","oil change","car maintenance"],
+    "gym fitness":         ["fitness center","yoga studio","crossfit","pilates","personal training","health club"],
+    "real estate":         ["realtor","property management","real estate broker","home buying","property dealer"],
+    "insurance agent":     ["insurance broker","insurance company","life insurance","auto insurance","home insurance"],
+    "mortgage broker":     ["mortgage lender","home loan","refinance","mortgage company","loan officer"],
+    "web designer":        ["web development","website design","web developer","digital agency","ux designer"],
+    "photographer":        ["photography studio","wedding photographer","portrait photographer","commercial photographer"],
 }
 
 NEARBY_CITIES = {
-    "new york":    ["Brooklyn NY","Queens NY","Newark NJ"],
-    "los angeles": ["Long Beach CA","Pasadena CA","Glendale CA"],
-    "chicago":     ["Evanston IL","Oak Park IL","Naperville IL"],
-    "houston":     ["Sugar Land TX","The Woodlands TX"],
-    "miami":       ["Fort Lauderdale FL","Hollywood FL"],
-    "lahore":      ["Islamabad Pakistan","Karachi Pakistan"],
-    "karachi":     ["Lahore Pakistan","Islamabad Pakistan"],
+    "new york":    ["Brooklyn NY","Queens NY","Bronx NY","Staten Island NY","Newark NJ","Jersey City NJ","Hoboken NJ"],
+    "los angeles": ["Long Beach CA","Pasadena CA","Glendale CA","Santa Monica CA","Burbank CA","Torrance CA"],
+    "chicago":     ["Evanston IL","Oak Park IL","Naperville IL","Schaumburg IL","Aurora IL"],
+    "houston":     ["Sugar Land TX","The Woodlands TX","Pasadena TX","Katy TX","Pearland TX"],
+    "miami":       ["Fort Lauderdale FL","Hollywood FL","Boca Raton FL","Coral Gables FL","Hialeah FL"],
+    "dallas":      ["Fort Worth TX","Arlington TX","Plano TX","Irving TX","Garland TX"],
+    "phoenix":     ["Scottsdale AZ","Tempe AZ","Mesa AZ","Chandler AZ","Glendale AZ"],
+    "london":      ["Westminster London","Canary Wharf London","Shoreditch London","Chelsea London","Brixton London"],
+    "lahore":      ["Islamabad Pakistan","Karachi Pakistan","Rawalpindi Pakistan","Faisalabad Pakistan"],
+    "karachi":     ["Lahore Pakistan","Islamabad Pakistan","Hyderabad Pakistan"],
+    "islamabad":   ["Rawalpindi Pakistan","Lahore Pakistan"],
+    "dubai":       ["Abu Dhabi UAE","Sharjah UAE","Ajman UAE"],
+    "toronto":     ["Mississauga ON","Brampton ON","Markham ON","Scarborough ON"],
+    "sydney":      ["Melbourne Australia","Brisbane Australia","Perth Australia"],
 }
 
 def get_related(query):
     q = query.lower().strip()
+    # Exact or partial match
     for key, terms in RELATED_TERMS.items():
         if key in q or q in key:
             return terms
-    return [f"best {query}", f"top {query}", f"{query} services"]
+    # Word-level match (e.g. "restaurants" matches "restaurant")
+    q_words = set(q.split())
+    for key, terms in RELATED_TERMS.items():
+        key_words = set(key.split())
+        if q_words & key_words:  # any word in common
+            return terms
+    # Fallback: generate cuisine/type variants
+    return [
+        f"best {query}", f"top {query}", f"local {query}",
+        f"{query} near me", f"affordable {query}", f"popular {query}",
+    ]
 
 def get_nearby(city):
     key = city.lower().split(",")[0].strip()
