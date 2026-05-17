@@ -367,25 +367,47 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                                 return add(batch, src_tag)
                 return add(batch, src_tag)
 
-            def safe_run(q, c, needed, label, src_tag):
-                """run_source with auto Chrome restart on tab crash."""
+            consecutive_timeouts = [0]  # mutable counter for nested fn
+
+            def restart_chrome():
                 nonlocal driver
+                log("   🔄 Restarting Chrome...")
+                try: driver.quit()
+                except: pass
                 try:
-                    return run_source(q, c, needed, label, src_tag)
+                    driver = build_driver()
+                    log("   ✓ Chrome restarted successfully")
+                    consecutive_timeouts[0] = 0
+                    return True
+                except Exception as e:
+                    log(f"   ❌ Chrome restart failed: {e}")
+                    return False
+
+            def safe_run(q, c, needed, label, src_tag):
+                """run_source with auto Chrome restart on any crash or timeout."""
+                nonlocal driver
+                # If Chrome is already dead, restart before trying
+                try:
+                    driver.execute_script("return 1;")
+                except Exception:
+                    log(f"   ⚠ Chrome dead before {label} — restarting...")
+                    if not restart_chrome():
+                        return 0
+                try:
+                    result = run_source(q, c, needed, label, src_tag)
+                    consecutive_timeouts[0] = 0
+                    return result
                 except Exception as e:
                     err = str(e).lower()
-                    if any(x in err for x in ["tab crashed","no such window","no such session","disconnected"]):
-                        log(f"   ⚠ Chrome crashed — restarting...")
-                        try: driver.quit()
-                        except: pass
-                        try:
-                            driver = build_driver()
-                            log("   ✓ Chrome restarted — retrying...")
-                            return run_source(q, c, needed, label, src_tag)
-                        except Exception as e2:
-                            log(f"   ❌ Retry failed: {e2}")
-                            return 0
-                    log(f"   ❌ Source error: {e}")
+                    if any(x in err for x in ["tab crashed","no such window","no such session","disconnected","timeout"]):
+                        log(f"   ⚠ Chrome crashed in {label} — restarting...")
+                        if restart_chrome():
+                            try:
+                                return run_source(q, c, needed, label, src_tag)
+                            except Exception as e2:
+                                log(f"   ❌ Retry failed: {e2}")
+                    else:
+                        log(f"   ❌ Source error: {e}")
                     return 0
 
             n = safe_run(request.query, request.city, request.limit, "Primary", "Google Maps")
@@ -422,11 +444,13 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
 
         log(f"\n✓ Scraping done: {len(all_leads)} leads in {time.time()-t0:.1f}s")
 
-        # Track usage
+        # Track usage (skip for owner accounts)
         if request.user_id:
-            add_leads_used(request.user_id, len(all_leads))
+            is_owner = request.user_id.strip() in [uid.strip() for uid in OWNER_USER_IDS if uid.strip()]
+            if not is_owner:
+                add_leads_used(request.user_id, len(all_leads))
             remaining = get_leads_remaining(request.user_id)
-            log(f"📊 Plan usage updated — {remaining} leads remaining this period")
+            log(f"📊 Plan usage updated — {remaining} leads remaining this period{' (owner bypass)' if is_owner else ''}")
 
         # Find emails
         if request.find_emails and not jobs[job_id].get("cancelled"):

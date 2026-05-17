@@ -288,12 +288,14 @@ def collect_urls_fast(driver, query, city, max_count, log, label=""):
     log(f"   {tag}🔍 Searching: {query} in {city}")
     try:
         driver.get(url)
-    except Exception:
-        log(f"   {tag}⚠ Page load timeout — retrying...")
+    except Exception as load_err:
+        log(f"   {tag}⚠ Page load failed: {type(load_err).__name__} — retrying...")
+        time.sleep(2)
         try:
             driver.get(url)
-        except Exception:
-            return []
+        except Exception as retry_err:
+            log(f"   {tag}⚠ Retry also failed: {type(retry_err).__name__}")
+            raise  # re-raise so safe_run can restart Chrome
 
     # Smart wait — wait for results panel, not fixed sleep
     panel = None
