@@ -292,12 +292,18 @@ def collect_urls_fast(driver, query, city, max_count, log, label=""):
     passes    = 0
 
     while len(collected) < max_count and no_new < MAX_NO_NEW:
-        # JS grab ALL hrefs at once — much faster than find_elements
-        hrefs = driver.execute_script("""
-            return Array.from(
-                document.querySelectorAll("a[href*='/maps/place/']")
-            ).map(a => a.href).filter(h => h.includes("/maps/place/"));
-        """) or []
+        try:
+            # JS grab ALL hrefs at once — much faster than find_elements
+            hrefs = driver.execute_script("""
+                return Array.from(
+                    document.querySelectorAll("a[href*='/maps/place/']")
+                ).map(a => a.href).filter(h => h.includes("/maps/place/"));
+            """) or []
+        except Exception as js_err:
+            if "tab crashed" in str(js_err).lower() or "no such window" in str(js_err).lower():
+                log(f"   {tag}⚠ Tab crashed — stopping scroll, returning {len(collected)} URLs")
+                break
+            hrefs = []
 
         before = len(collected)
         for h in hrefs:
@@ -316,7 +322,10 @@ def collect_urls_fast(driver, query, city, max_count, log, label=""):
         try:
             driver.execute_script(f"arguments[0].scrollTop += {step}", panel)
         except Exception:
-            driver.execute_script(f"window.scrollBy(0, {step})")
+            try:
+                driver.execute_script(f"window.scrollBy(0, {step})")
+            except Exception:
+                break  # can't scroll → tab dead
 
         time.sleep(SCROLL_WAIT)
 
@@ -328,12 +337,16 @@ def collect_urls_fast(driver, query, city, max_count, log, label=""):
                 pass
 
         # JS end-detection (instant, no body.text scan)
-        ended = driver.execute_script("""
-            var t = document.body ? document.body.innerText : "";
-            return t.includes("reached the end") ||
-                   t.includes("No more results") ||
-                   !!document.querySelector(".HlvSq");
-        """)
+        try:
+            ended = driver.execute_script("""
+                var t = document.body ? document.body.innerText : "";
+                return t.includes("reached the end") ||
+                       t.includes("No more results") ||
+                       !!document.querySelector(".HlvSq");
+            """)
+        except Exception:
+            log(f"   {tag}⚠ Tab crashed during end-check — stopping")
+            break
         if ended:
             log(f"   {tag}End of results after {passes} scrolls")
             break

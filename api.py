@@ -367,7 +367,28 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                                 return add(batch, src_tag)
                 return add(batch, src_tag)
 
-            n = run_source(request.query, request.city, request.limit, "Primary", "Google Maps")
+            def safe_run(q, c, needed, label, src_tag):
+                """run_source with auto Chrome restart on tab crash."""
+                nonlocal driver
+                try:
+                    return run_source(q, c, needed, label, src_tag)
+                except Exception as e:
+                    err = str(e).lower()
+                    if any(x in err for x in ["tab crashed","no such window","no such session","disconnected"]):
+                        log(f"   ⚠ Chrome crashed — restarting...")
+                        try: driver.quit()
+                        except: pass
+                        try:
+                            driver = build_driver()
+                            log("   ✓ Chrome restarted — retrying...")
+                            return run_source(q, c, needed, label, src_tag)
+                        except Exception as e2:
+                            log(f"   ❌ Retry failed: {e2}")
+                            return 0
+                    log(f"   ❌ Source error: {e}")
+                    return 0
+
+            n = safe_run(request.query, request.city, request.limit, "Primary", "Google Maps")
             log(f"✓ +{n} leads  |  total: {len(all_leads)}/{request.limit}  |  {time.time()-t0:.1f}s")
 
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
@@ -376,7 +397,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 for i, term in enumerate(related, 1):
                     if len(all_leads) >= request.limit or jobs[job_id].get("cancelled"):
                         break
-                    n = run_source(term, request.city, request.limit - len(all_leads), f"Related-{i}", f"Google Maps ({term})")
+                    n = safe_run(term, request.city, request.limit - len(all_leads), f"Related-{i}", f"Google Maps ({term})")
                     log(f"   +{n}  total: {len(all_leads)}/{request.limit}")
 
             if len(all_leads) < request.limit and not jobs[job_id].get("cancelled"):
@@ -386,7 +407,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                     for i, nc in enumerate(nearby, 1):
                         if len(all_leads) >= request.limit or jobs[job_id].get("cancelled"):
                             break
-                        n = run_source(request.query, nc, request.limit - len(all_leads), f"Nearby-{i}", f"Google Maps ({nc})")
+                        n = safe_run(request.query, nc, request.limit - len(all_leads), f"Nearby-{i}", f"Google Maps ({nc})")
                         log(f"   +{n}  total: {len(all_leads)}/{request.limit}")
         finally:
             if driver:
@@ -492,7 +513,7 @@ def get_job(job_id: str):
     return {
         "job_id":job_id,"status":job["status"],"query":job["query"],"city":job["city"],
         "leads_found":job["leads_found"],"current_source":job.get("current_source",""),
-        "logs":job["logs"][-30:],"leads":job["leads"],"excel_file":job.get("excel_file"),
+        "logs":job["logs"][-100:],"leads":job["leads"],"excel_file":job.get("excel_file"),
         "sheets_added":job.get("sheets_added",0),"error":job.get("error"),
         "created_at":job["created_at"],"completed_at":job.get("completed_at"),
     }
