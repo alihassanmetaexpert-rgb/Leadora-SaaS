@@ -150,13 +150,14 @@ def build_driver():
 import urllib3
 urllib3.disable_warnings()
 
-SCROLL_WAIT    = 0.6    # was 1.5s
+SCROLL_WAIT    = 0.5    # was 1.5s
 PAGE_WAIT      = 1.5    # was 4.0s  
 DETAIL_WAIT    = 0.8    # was 2.5s
-SCROLL_STEP    = 1500   # was 1000 — bigger = fewer passes
-MAX_NO_NEW     = 6      # was 12 — stop faster
-EMAIL_WORKERS  = 8      # parallel email threads
-DETAIL_WORKERS = 3      # parallel headless Chrome workers
+SCROLL_STEP    = 2000   # bigger scroll = fewer passes needed
+MAX_NO_NEW     = 4      # stop faster when no new results
+EMAIL_WORKERS  = 6      # parallel email threads (reduced for Railway RAM)
+DETAIL_WORKERS = 1      # single driver mode on Railway (avoids OOM crash)
+EMAIL_TIMEOUT  = 6      # seconds per email fetch before giving up
 
 EMAIL_REGEX  = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 SKIP_EMAILS  = {"sentry","wix","google","facebook","example","domain","schema","w3.org","jquery","cloudflare"}
@@ -189,6 +190,18 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-notifications")
     opts.add_argument("--disable-popup-blocking")
     opts.add_argument("--blink-settings=imagesEnabled=false")  # block images
+    # Extra memory optimizations for Railway
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--max_old_space_size=256")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--hide-scrollbars")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--safebrowsing-disable-auto-update")
+    opts.add_argument("--single-process")  # saves ~150MB RAM on Railway
     if os.path.exists("/usr/bin/chromium"):
         opts.binary_location = "/usr/bin/chromium"
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
@@ -510,8 +523,11 @@ def _valid_email(email):
 
 def _fetch(url, timeout=5):
     try:
-        r = requests.get(url, headers=REQ_HEADERS, timeout=timeout, verify=False)
-        return r.text if r.status_code == 200 else None
+        r = requests.get(url, headers=REQ_HEADERS, timeout=timeout, verify=False,
+                        allow_redirects=True)
+        if r.status_code == 200:
+            return r.text[:200000]  # max 200KB to avoid hanging on huge pages
+        return None
     except Exception:
         return None
 
@@ -529,11 +545,17 @@ def find_email_fast(website):
             if _valid_email(e): found.append(e)
         return list(dict.fromkeys(found))
 
-    emails = extract(_fetch(website))
-    if not emails:
-        for path in ["contact","contact-us","about"]:
-            emails = extract(_fetch(f"{website}/{path}", timeout=4))
-            if emails: break
+    try:
+        emails = extract(_fetch(website, timeout=6))
+        if not emails:
+            for path in ["contact", "contact-us", "about"]:
+                try:
+                    emails = extract(_fetch(f"{website}/{path}", timeout=4))
+                    if emails: break
+                except Exception:
+                    continue
+    except Exception:
+        return ""
 
     return sorted(emails, key=len)[0] if emails else ""
 
