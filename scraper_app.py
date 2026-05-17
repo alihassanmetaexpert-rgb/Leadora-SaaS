@@ -194,14 +194,8 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-default-apps")
     opts.add_argument("--disable-sync")
-    opts.add_argument("--disable-translate")
-    opts.add_argument("--hide-scrollbars")
     opts.add_argument("--no-first-run")
-    opts.add_argument("--safebrowsing-disable-auto-update")
     opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    opts.add_argument("--renderer-process-limit=1")
-    opts.add_argument("--js-flags=--max-old-space-size=128")
     if os.path.exists("/usr/bin/chromium"):
         opts.binary_location = "/usr/bin/chromium"
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
@@ -220,6 +214,8 @@ def _make_chrome(headless=False):
     chromedriver_path = shutil.which("chromedriver") or "/usr/bin/chromedriver"
     svc    = Service(chromedriver_path)
     driver = webdriver.Chrome(service=svc, options=opts)
+    driver.set_page_load_timeout(30)   # kill page if it hangs >30s
+    driver.set_script_timeout(15)      # kill JS if it hangs >15s
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source":
         "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
         "Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});"
@@ -251,7 +247,14 @@ def collect_urls_fast(driver, query, city, max_count, log, label=""):
     url    = f"https://www.google.com/maps/search/{search}"
 
     log(f"   {tag}🔍 Searching: {query} in {city}")
-    driver.get(url)
+    try:
+        driver.get(url)
+    except Exception:
+        log(f"   {tag}⚠ Page load timeout — retrying...")
+        try:
+            driver.get(url)
+        except Exception:
+            return []
 
     # Smart wait — wait for results panel, not fixed sleep
     panel = None
@@ -353,7 +356,11 @@ def scrape_listing_fast(driver, url):
     data["maps_url"] = url
 
     try:
-        driver.get(url)
+        try:
+            driver.get(url)
+        except Exception:
+            # Page load timeout — return empty rather than crash
+            return data
 
         # Smart wait: wait for name element instead of sleep
         try:
