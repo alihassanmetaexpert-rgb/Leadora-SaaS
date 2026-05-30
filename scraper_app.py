@@ -235,6 +235,17 @@ def _make_chrome(headless=False):
     opts.add_argument("--disable-sync")
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-software-rasterizer")
+    # Critical Railway OOM fixes
+    opts.add_argument("--no-zygote")
+    opts.add_argument("--single-process")
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--disable-features=VizDisplayCompositor")
+    opts.add_argument("--js-flags=--max-old-space-size=512")
+    opts.add_argument("--renderer-process-limit=1")
+    opts.add_argument("--disable-crash-reporter")
+    opts.add_argument("--disable-in-process-stack-traces")
+    opts.add_argument("--disable-logging")
+    opts.add_argument("--disable-breakpad")
     if os.path.exists("/usr/bin/chromium"):
         opts.binary_location = "/usr/bin/chromium"
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
