@@ -60,27 +60,51 @@ PLANS = {
 import redis as redis_lib
 
 REDIS_URL    = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis_lib.from_url(REDIS_URL, decode_responses=True)
+redis_client = redis_lib.from_url(
+    REDIS_URL,
+    decode_responses=True,
+    socket_connect_timeout=5,
+    socket_timeout=5,
+    retry_on_timeout=True,
+    health_check_interval=30,
+)
 
 def save_token(user_id: str, token_data: dict):
-    redis_client.set(f"token:{user_id}", json.dumps(token_data), ex=60*60*24*30)
+    try:
+        redis_client.set(f"token:{user_id}", json.dumps(token_data), ex=60*60*24*30)
+    except Exception as e:
+        print(f"[Redis] save_token failed: {e}")
 
 def get_token(user_id: str) -> dict:
-    data = redis_client.get(f"token:{user_id}")
-    return json.loads(data) if data else None
+    try:
+        data = redis_client.get(f"token:{user_id}")
+        return json.loads(data) if data else None
+    except Exception as e:
+        print(f"[Redis] get_token failed: {e}")
+        return None
 
 def delete_token(user_id: str):
-    redis_client.delete(f"token:{user_id}")
+    try:
+        redis_client.delete(f"token:{user_id}")
+    except Exception as e:
+        print(f"[Redis] delete_token failed: {e}")
 
 def has_token(user_id: str) -> bool:
-    return redis_client.exists(f"token:{user_id}") > 0
+    try:
+        return redis_client.exists(f"token:{user_id}") > 0
+    except Exception as e:
+        print(f"[Redis] has_token failed: {e}")
+        return False
 
 # ── Plan helpers ──────────────────────────────────────────────────────────────
 
 def get_user_plan(user_id: str) -> dict:
-    data = redis_client.get(f"plan:{user_id}")
-    if data:
-        return json.loads(data)
+    try:
+        data = redis_client.get(f"plan:{user_id}")
+        if data:
+            return json.loads(data)
+    except Exception as e:
+        print(f"[Redis] get_user_plan failed: {e}")
     return {
         "plan": "free_trial", "leads_used": 0, "leads_limit": 50,
         "monthly": False, "subscription_id": None,
@@ -88,30 +112,44 @@ def get_user_plan(user_id: str) -> dict:
     }
 
 def save_user_plan(user_id: str, plan_data: dict):
-    redis_client.set(f"plan:{user_id}", json.dumps(plan_data), ex=60*60*24*400)
+    try:
+        redis_client.set(f"plan:{user_id}", json.dumps(plan_data), ex=60*60*24*400)
+    except Exception as e:
+        print(f"[Redis] save_user_plan failed: {e}")
 
 def get_month_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 def get_leads_used_this_month(user_id: str) -> int:
-    val = redis_client.get(f"usage:{user_id}:{get_month_key()}")
-    return int(val) if val else 0
+    try:
+        val = redis_client.get(f"usage:{user_id}:{get_month_key()}")
+        return int(val) if val else 0
+    except Exception as e:
+        print(f"[Redis] get_leads_used_this_month failed: {e}")
+        return 0
 
 def add_leads_used(user_id: str, count: int):
-    plan_data = get_user_plan(user_id)
-    if plan_data["plan"] == "free_trial":
-        plan_data["leads_used"] = plan_data.get("leads_used", 0) + count
-        save_user_plan(user_id, plan_data)
-    else:
-        key = f"usage:{user_id}:{get_month_key()}"
-        redis_client.incr(key, count)
-        redis_client.expire(key, 60*60*24*35)
+    try:
+        plan_data = get_user_plan(user_id)
+        if plan_data["plan"] == "free_trial":
+            plan_data["leads_used"] = plan_data.get("leads_used", 0) + count
+            save_user_plan(user_id, plan_data)
+        else:
+            key = f"usage:{user_id}:{get_month_key()}"
+            redis_client.incr(key, count)
+            redis_client.expire(key, 60*60*24*35)
+    except Exception as e:
+        print(f"[Redis] add_leads_used failed: {e}")
 
 def get_leads_remaining(user_id: str) -> int:
-    plan_data = get_user_plan(user_id)
-    limit = PLANS[plan_data["plan"]]["leads_limit"]
-    used  = plan_data.get("leads_used", 0) if plan_data["plan"] == "free_trial" else get_leads_used_this_month(user_id)
-    return max(0, limit - used)
+    try:
+        plan_data = get_user_plan(user_id)
+        limit = PLANS[plan_data["plan"]]["leads_limit"]
+        used  = plan_data.get("leads_used", 0) if plan_data["plan"] == "free_trial" else get_leads_used_this_month(user_id)
+        return max(0, limit - used)
+    except Exception as e:
+        print(f"[Redis] get_leads_remaining failed: {e}")
+        return 999  # fail open — don't block the user
 
 # ── Owner bypass for testing ──────────────────────────────────────────────────
 OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "").split(",")
