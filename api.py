@@ -782,6 +782,27 @@ def list_user_sheets(user_id: str):
         return {"success": False, "message": f"Error: {err}", "sheets": []}
 
 
+# ── Debug endpoint ────────────────────────────────────────────────────────────
+
+@app.get("/auth/debug-token")
+async def debug_token(request: Request):
+    import requests as req
+    code = request.query_params.get("code", "")
+    if not code:
+        return {"error": "No code provided — usage: /auth/debug-token?code=YOUR_CODE"}
+    response = req.post("https://oauth2.googleapis.com/token", data={
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    })
+    result = response.json()
+    if "access_token" in result:
+        save_token("debug_test", result)
+        return {"status": response.status_code, "success": True, "has_access_token": True, "has_refresh_token": "refresh_token" in result, "redirect_uri_used": REDIRECT_URI}
+    return {"status": response.status_code, "success": False, "error": result, "redirect_uri_used": REDIRECT_URI}
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
