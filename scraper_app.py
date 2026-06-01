@@ -604,7 +604,7 @@ def _fetch(url, timeout=5):
         return None
 
 def find_email_fast(website):
-    """Find email: homepage first, contact page only if needed."""
+    """Find email: check homepage + 12 common pages for maximum coverage."""
     if not website: return ""
     if not website.startswith("http"): website = "https://" + website
     website = website.split("?")[0].rstrip("/")
@@ -615,21 +615,31 @@ def find_email_fast(website):
         for m in re.findall(r'href=["\']mailto:([^"\'>\s]+)', html):
             e = m.split("?")[0].lower()
             if _valid_email(e): found.append(e)
+        for m in re.findall(r'data-email=["\']([^"\'>\s]+)', html):
+            if _valid_email(m): found.append(m.lower())
         return list(dict.fromkeys(found))
 
+    PAGES_TO_CHECK = [
+        "",
+        "contact", "contact-us", "contact_us", "contacts",
+        "about", "about-us", "about_us",
+        "team", "our-team", "staff",
+        "reach-us", "get-in-touch", "info", "support",
+    ]
+
     try:
-        emails = extract(_fetch(website, timeout=6))
-        if not emails:
-            for path in ["contact", "contact-us", "about"]:
-                try:
-                    emails = extract(_fetch(f"{website}/{path}", timeout=4))
-                    if emails: break
-                except Exception:
-                    continue
+        for path in PAGES_TO_CHECK:
+            url = f"{website}/{path}" if path else website
+            try:
+                emails = extract(_fetch(url, timeout=5))
+                if emails:
+                    return sorted(emails, key=len)[0]
+            except Exception:
+                continue
     except Exception:
         return ""
 
-    return sorted(emails, key=len)[0] if emails else ""
+    return ""
 
 
 def find_emails_parallel(leads, log_fn, update_fn, stop_fn):
