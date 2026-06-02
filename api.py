@@ -50,10 +50,10 @@ LEMONSQUEEZY_VARIANT_MAP = {
 
 # ── Plan definitions ──────────────────────────────────────────────────────────
 PLANS = {
-    "free_trial": {"name": "Free Trial", "leads_limit": 50,   "monthly": False, "price": 0},
-    "basic":      {"name": "Basic",      "leads_limit": 300,  "monthly": True,  "price": 19},
-    "pro":        {"name": "Pro",        "leads_limit": 1000, "monthly": True,  "price": 49},
-    "agency":     {"name": "Agency",     "leads_limit": 5000, "monthly": True,  "price": 99},
+    "free_trial": {"name": "Free Trial", "leads_limit": 100,  "monthly": False, "price": 0},
+    "basic":      {"name": "Basic",      "leads_limit": 1000, "monthly": True,  "price": 19},
+    "pro":        {"name": "Pro",        "leads_limit": 3000, "monthly": True,  "price": 49},
+    "agency":     {"name": "Agency",     "leads_limit": 10000,"monthly": True,  "price": 99},
 }
 
 # ── Redis setup ───────────────────────────────────────────────────────────────
