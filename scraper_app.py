@@ -194,7 +194,7 @@ PAGE_WAIT      = 1.5    # was 4.0s
 DETAIL_WAIT    = 0.8    # was 2.5s
 SCROLL_STEP    = 2000   # bigger scroll = fewer passes needed
 MAX_NO_NEW     = 4      # stop faster when no new results
-EMAIL_WORKERS  = 6      # parallel email threads (reduced for Railway RAM)
+EMAIL_WORKERS  = 10     # parallel email threads
 DETAIL_WORKERS = 1      # single driver mode on Railway (avoids OOM crash)
 EMAIL_TIMEOUT  = 6      # seconds per email fetch before giving up
 
@@ -604,7 +604,7 @@ def _fetch(url, timeout=5):
         return None
 
 def find_email_fast(website):
-    """Find email: check homepage + 12 common pages for maximum coverage."""
+    """Find email: check 15 pages in parallel for maximum coverage and speed."""
     if not website: return ""
     if not website.startswith("http"): website = "https://" + website
     website = website.split("?")[0].rstrip("/")
@@ -619,7 +619,7 @@ def find_email_fast(website):
             if _valid_email(m): found.append(m.lower())
         return list(dict.fromkeys(found))
 
-    PAGES_TO_CHECK = [
+    PAGES = [
         "",
         "contact", "contact-us", "contact_us", "contacts",
         "about", "about-us", "about_us",
@@ -627,19 +627,39 @@ def find_email_fast(website):
         "reach-us", "get-in-touch", "info", "support",
     ]
 
+    # First check homepage — fastest, most likely to have email
     try:
-        for path in PAGES_TO_CHECK:
-            url = f"{website}/{path}" if path else website
-            try:
-                emails = extract(_fetch(url, timeout=5))
-                if emails:
-                    return sorted(emails, key=len)[0]
-            except Exception:
-                continue
+        emails = extract(_fetch(website, timeout=4))
+        if emails:
+            return sorted(emails, key=len)[0]
     except Exception:
-        return ""
+        pass
 
-    return ""
+    # Check remaining pages in parallel — stop as soon as one returns email
+    import concurrent.futures
+    result = [""]
+
+    def check_page(path):
+        if result[0]: return ""
+        try:
+            emails = extract(_fetch(f"{website}/{path}", timeout=3))
+            if emails:
+                result[0] = sorted(emails, key=len)[0]
+            return result[0]
+        except Exception:
+            return ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(check_page, p) for p in PAGES[1:]]
+        for fut in concurrent.futures.as_completed(futs):
+            r = fut.result()
+            if r:
+                # Cancel remaining
+                for f in futs:
+                    f.cancel()
+                return r
+
+    return result[0]
 
 
 def find_emails_parallel(leads, log_fn, update_fn, stop_fn):
