@@ -417,7 +417,7 @@ def scrape_listing_fast(driver, url):
     """
     data = {k: "" for k in [
         "name","category","address","city",
-        "phone","website","rating","maps_url","source"]}
+        "phone","email","website","rating","maps_url","source"]}
     data["maps_url"] = url
 
     try:

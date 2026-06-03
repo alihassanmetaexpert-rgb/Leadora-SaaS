@@ -354,6 +354,7 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
                 if phone:
                     seen_phones.add(phone)
                 lead["source"] = src_tag
+                lead.setdefault("email", "")  # ensure email key always exists for frontend
                 all_leads.append(lead)
                 added += 1
                 log(f"  [{len(all_leads)}/{request.limit}] ✓ {lead['name']}" + (f"  |  {phone}" if phone else ""))
@@ -497,7 +498,9 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
             def email_upd(name, email, done, total):
                 if email:
                     log(f"  ✉ {name} → {email}")
-                jobs[job_id]["leads"] = all_leads.copy()
+                else:
+                    log(f"  — {name} → no email")
+                jobs[job_id]["leads"] = all_leads.copy()  # always sync so frontend gets emails live
             find_emails_parallel(all_leads, log, email_upd, lambda: jobs[job_id].get("cancelled", False))
             log(f"✓ Email search done")
 
