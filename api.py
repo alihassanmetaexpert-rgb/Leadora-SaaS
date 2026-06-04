@@ -192,6 +192,17 @@ jobs: dict = {}
 app = FastAPI(title="Leadora API", description="Google Maps Lead Generation API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+# ── Health check ──────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health_check():
+    try:
+        redis_client.ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
+    return {"status": "ok", "redis": "connected" if redis_ok else "disconnected"}
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ScrapeRequest(BaseModel):
@@ -703,14 +714,14 @@ async def paddle_webhook(request: Request):
 def auth_login(user_id: str):
     if not GOOGLE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Google OAuth not configured")
-    return {"auth_url": get_google_auth_url(user_id)}
+    return RedirectResponse(url=get_google_auth_url(user_id))
 
 @app.get("/auth/callback")
 def auth_callback(code: str, state: str):
     try:
         token_data = exchange_code_for_token(code)
         save_token(state, token_data)
-        return RedirectResponse(url=f"https://mapseeker-spark.lovable.app/dashboard?sheets_connected=true&user_id={state}")
+        return RedirectResponse(url=f"https://leadoraleads.lovable.app/dashboard?sheets_connected=true&user_id={state}")
     except Exception as e:
         return JSONResponse({"error":str(e)}, status_code=500)
 
