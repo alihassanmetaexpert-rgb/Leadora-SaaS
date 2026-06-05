@@ -6,6 +6,10 @@ Tokens and plans stored in Redis for persistence across restarts.
 """
 
 import os
+import sys
+import importlib
+sys.dont_write_bytecode = True  # prevent .pyc cache issues
+
 import uuid
 import json
 import hashlib
@@ -340,6 +344,10 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         log(f"🎯 Target: {request.limit} leads")
         log("=" * 50)
 
+        # Force fresh import — invalidate any cached .pyc
+        if 'scraper_app' in sys.modules:
+            del sys.modules['scraper_app']
+        importlib.invalidate_caches()
         from scraper_app import (
             build_driver, collect_urls_fast, scrape_listing_fast,
             find_emails_parallel, export_excel, get_related, get_nearby, SAVE_FOLDER,
