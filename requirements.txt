@@ -10,4 +10,4 @@ python-dotenv
 openpyxl
 requests
 beautifulsoup4
-redis#redeploy 
+redis
