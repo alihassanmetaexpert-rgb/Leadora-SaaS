@@ -100,6 +100,78 @@ def has_token(user_id: str) -> bool:
         print(f"[Redis] has_token failed: {e}")
         return False
 
+# ── Supabase setup (persistent lead storage) ─────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+def supabase_save_leads(user_id: str, job_id: str, leads: list):
+    """Save scraped leads to Supabase for permanent storage."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not leads:
+        return
+    try:
+        import requests as req
+        rows = []
+        for lead in leads:
+            rows.append({
+                "user_id":  user_id,
+                "job_id":   job_id,
+                "name":     lead.get("name", ""),
+                "category": lead.get("category", ""),
+                "address":  lead.get("address", ""),
+                "city":     lead.get("city", ""),
+                "phone":    lead.get("phone", ""),
+                "email":    lead.get("email", ""),
+                "website":  lead.get("website", ""),
+                "rating":   lead.get("rating", ""),
+                "source":   lead.get("source", "Google Maps"),
+                "maps_url": lead.get("maps_url", ""),
+            })
+        # Insert in batches of 100
+        for i in range(0, len(rows), 100):
+            batch = rows[i:i+100]
+            resp = req.post(
+                f"{SUPABASE_URL}/rest/v1/leads",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json=batch,
+                timeout=15,
+            )
+            if resp.status_code not in (200, 201):
+                print(f"[Supabase] Save leads failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"[Supabase] supabase_save_leads error: {e}")
+
+def supabase_get_leads(user_id: str, limit: int = 1000) -> list:
+    """Fetch all leads for a user from Supabase."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return []
+    try:
+        import requests as req
+        resp = req.get(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            params={
+                "user_id": f"eq.{user_id}",
+                "order": "scraped_at.desc",
+                "limit": limit,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"[Supabase] Get leads failed: {resp.status_code} {resp.text[:200]}")
+        return []
+    except Exception as e:
+        print(f"[Supabase] supabase_get_leads error: {e}")
+        return []
+
 # ── Plan helpers ──────────────────────────────────────────────────────────────
 
 def get_user_plan(user_id: str) -> dict:
@@ -552,6 +624,12 @@ def run_scrape_job(job_id: str, request: ScrapeRequest):
         jobs[job_id]["completed_at"]   = datetime.now().isoformat()
         jobs[job_id]["current_source"] = ""
 
+        # Save leads permanently to Supabase
+        if request.user_id and all_leads:
+            log(f"\n💾 Saving {len(all_leads)} leads to database...")
+            supabase_save_leads(request.user_id, job_id, all_leads)
+            log(f"✅ Leads saved to database!")
+
     except Exception as e:
         import traceback
         log(f"\n❌ Error: {e}")
@@ -627,6 +705,32 @@ def delete_job(job_id: str):
 @app.get("/jobs")
 def list_jobs():
     return [{"job_id":jid,"status":j["status"],"query":j["query"],"city":j["city"],"leads_found":j["leads_found"],"created_at":j["created_at"]} for jid,j in jobs.items()]
+
+@app.get("/user/{user_id}/leads")
+def get_user_leads(user_id: str, limit: int = 1000):
+    """Fetch all permanently saved leads for a user."""
+    leads = supabase_get_leads(user_id, limit)
+    return {"success": True, "leads": leads, "total": len(leads)}
+
+@app.delete("/user/{user_id}/leads")
+def delete_user_leads(user_id: str):
+    """Delete all leads for a user (optional cleanup)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return {"success": False, "message": "Supabase not configured"}
+    try:
+        import requests as req
+        resp = req.delete(
+            f"{SUPABASE_URL}/rest/v1/leads",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            params={"user_id": f"eq.{user_id}"},
+            timeout=10,
+        )
+        return {"success": resp.status_code in (200, 204), "message": "Leads deleted"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 # ── Plan routes ───────────────────────────────────────────────────────────────
 
