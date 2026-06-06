@@ -231,20 +231,8 @@ def get_leads_remaining(user_id: str) -> int:
 OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "").split(",")
 
 def check_plan_limit(user_id: str, requested: int):
-    if not user_id:
-        return True, ""
-    if user_id.strip() in [uid.strip() for uid in OWNER_USER_IDS if uid.strip()]:
-        return True, ""
-    plan_data  = get_user_plan(user_id)
-    plan_key   = plan_data["plan"]
-    limit      = PLANS[plan_key]["leads_limit"]
-    remaining  = get_leads_remaining(user_id)
-    if remaining <= 0:
-        msg = f"Free trial limit reached ({limit} leads total). Please upgrade to continue." if plan_key == "free_trial" else f"Monthly limit reached ({limit} leads). Resets next month or upgrade your plan."
-        return False, msg
-    if requested > remaining:
-        period = "trial" if plan_key == "free_trial" else "month"
-        return False, f"You only have {remaining} leads remaining this {period}. Reduce your request or upgrade your plan."
+    # ── Limits disabled until payment processor is approved ──────────────────
+    # Every user can scrape freely up to 500 leads per request
     return True, ""
 
 def activate_plan(user_id: str, plan_key: str, subscription_id: str = None):
