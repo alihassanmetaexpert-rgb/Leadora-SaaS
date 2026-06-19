@@ -42,6 +42,23 @@ Built as a direct alternative to Apollo.io ($149/month) and Outscraper, but at *
 - 📋 **Load My Sheets** — dropdown shows user's existing spreadsheets automatically
 - 🏷️ **15+ niche tags** — Marketing Agency, Dental Clinic, Law Firm, Restaurant, and more
 
+## Screenshots
+
+### 🏠 Landing Page
+![Landing Page](landing-page.png)
+
+### 🎯 Dashboard — Generate Leads
+![Dashboard](dashboard.png)
+
+### 📋 Live Results — 495 Leads Found
+![Leads Table](leads-table.png)
+
+### 📊 Auto-Sync to Google Sheets
+![Google Sheets](google-sheets.png)
+
+### ✅ Google Sheets Connected
+![Sheets Connected](sheets-connected.png)
+
 ---
 
 ## Tech Stack
